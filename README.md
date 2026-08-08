@@ -6,7 +6,7 @@
 
 Huazhong University of Science and Technology<sup>1</sup> &middot; D-Robotics<sup>2</sup> &middot; Horizon Robotics<sup>3</sup> &middot; Xiamen University<sup>4</sup>
 
-<a href="https://arxiv.org/pdf/2608.04404"><img src="https://img.shields.io/badge/Paper-arXiv-b31b1b" alt="Paper arXiv"></a>
+<a href="https://arxiv.org/pdf/2608.04404"><img src="https://img.shields.io/badge/Paper-arXiv-b31b1b" alt="Paper arXiv"></a> <a href="https://huggingface.co/hustvl/FasterWAM"><img src="https://img.shields.io/badge/Model-HuggingFace-orange" alt="Model HuggingFace"></a>
 
 </div>
 
@@ -18,24 +18,24 @@ The key insight behind **Faster-WAM** is that future representations are not mer
 
 ---
 
-## Index
+## Table of Contents
 
-- [Release](#release)
+- [Release Progress](#release-progress)
 - [File Structure](#file-structure)
 - [Environment Setup](#environment-setup)
 - [Model Preparation](#model-preparation)
 - [Dataset Download](#dataset-download)
 - [Training](#training)
+- [Released Checkpoints](#released-checkpoints)
 - [Evaluation](#evaluation)
 - [Acknowledgments](#acknowledgments)
+- [Citation](#citation)
 
-## Release
+## Release Progress
 
-Training and inference code ✅
-
-LIBERO, LIBERO-Plus, and RoboTwin evaluation code ✅
-
-Model checkpoints
+- Training and inference code. [✔]
+- LIBERO, LIBERO-Plus, and RoboTwin evaluation code. [✔]
+- Model checkpoints. [✔]
 
 ## File Structure
 
@@ -189,7 +189,7 @@ data/robotwin2.0/
 
 ## Training
 
-### 1. Precompute instruction embeddings
+### Precompute instruction embeddings
 
 Training reads cached T5 instruction embeddings. Generate them once after the
 dataset has been extracted:
@@ -213,7 +213,7 @@ torchrun --standalone --nproc_per_node=8 \
 The caches are written to `data/text_embeds_cache_fasterwam/libero` and
 `data/text_embeds_cache_fasterwam/robotwin`.
 
-### 2. Launch training
+### Launch training
 
 ```bash
 NPROC_PER_NODE=8 bash scripts/train_fasterwam_libero.sh
@@ -228,6 +228,30 @@ NPROC_PER_NODE=8 bash scripts/train_fasterwam_libero.sh \
   batch_size=8 \
   num_epochs=1 \
   wandb.enabled=true
+```
+
+## Released Checkpoints
+
+The released FasterWAM checkpoints and their corresponding dataset statistics
+are available on [Hugging Face](https://huggingface.co/hustvl/FasterWAM).
+
+```bash
+mkdir -p checkpoints/fasterwam_release
+
+huggingface-cli download hustvl/FasterWAM \
+  --local-dir checkpoints/fasterwam_release
+```
+
+After downloading, the checkpoint directory should have the following layout:
+
+```text
+checkpoints/fasterwam_release/
+├── libero/
+│   ├── step_021700.pt
+│   └── dataset_stats.json
+└── robotwin/
+    ├── step_029355.pt
+    └── dataset_stats.json
 ```
 
 ## Evaluation
@@ -285,3 +309,17 @@ Our codebase is built upon:
 
 We thank these teams for contributing their impressive code and models to the
 community.
+
+## Citation
+
+If you find this repository helpful for your research, please consider citing
+our paper:
+
+```bibtex
+@article{zhao2026faster,
+  title   = {Faster-WAM: Efficient Inference-Time Future Conditioning for Robust World Action Models},
+  author  = {Zhao, Weiheng and Jiang, Haoyi and Shi, Xin and Liu, Liu and Huang, Fan and Su, Zhizhong and Sui, Wei and Wang, Xinggang},
+  journal = {arXiv preprint arXiv:2608.04404},
+  year    = {2026}
+}
+```
