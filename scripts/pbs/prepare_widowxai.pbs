@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+#PBS -N fasterwam-widowxai-prep
+#PBS -q rt_HG
+#PBS -P gcg51472
+#PBS -l select=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+
+set -euo pipefail
+trap 'status=$?; echo "[prep] FAILED line=${LINENO} status=${status} time=$(date -Is)" >&2; exit "${status}"' ERR
+
+REPO_ROOT="/home/acf16376hu/gitrepo/FasterWAM"
+FASTWAM_REPO="/home/acf16376hu/gitrepo/FastWAM"
+ENV_ROOT="/groups/gcg51472/acf16376hu/fastwam"
+DATA_ROOT="/groups/gcg51472/acf16376hu/fasterwam"
+MODEL_ROOT="/groups/gcg51472/fastwam/checkpoints/diffsynth"
+REFERENCE_STATS="${ENV_ROOT}/dataset_stats.json"
+REFERENCE_TEXT_CACHE="${ENV_ROOT}/text_embeds_cache/widowxai"
+TEXT_CACHE="${DATA_ROOT}/text_embeds_cache/widowxai"
+ACTION_DIT_PATH="${DATA_ROOT}/checkpoints/SparseActionDiT_cond_0_4_8_12_16_20_24_28_Wan22_alphascale_1024hdim_widowxai.pt"
+STATS_PATH="${DATA_ROOT}/dataset_stats.json"
+READY_PATH="${DATA_ROOT}/widowxai_preparation.ready"
+
+# Reuse the already validated FastWAM Pixi installation and dependency graph.
+export FASTWAM_DATA_ROOT="${DATA_ROOT}"
+export FASTWAM_MODEL_ROOT="${MODEL_ROOT}"
+export FASTERWAM_OUTPUT_ROOT="${DATA_ROOT}/runs"
+export PIXI_HOME="${ENV_ROOT}/pixi"
+export TORCH_EXTENSIONS_DIR="${ENV_ROOT}/cache/torch_extensions"
+export HF_HOME="${ENV_ROOT}/cache/huggingface"
+export DIFFSYNTH_MODEL_BASE_PATH="${MODEL_ROOT}"
+export TMPDIR="${PBS_LOCALDIR:-${DATA_ROOT}/tmp/${PBS_JOBID}}"
+export PYTHONUNBUFFERED=1
+export PYTHONNOUSERSITE=1
+
+mkdir -p \
+  "${TMPDIR}" \
+  "${DATA_ROOT}/checkpoints" \
+  "${DATA_ROOT}/pbs_logs" \
+  "${DATA_ROOT}/preparation/widowxai" \
+  "${TEXT_CACHE}"
+exec > >(tee -a "${DATA_ROOT}/pbs_logs/widowxai-prep-${PBS_JOBID}.log") 2>&1
+cd "${REPO_ROOT}"
+
+run_in_env() {
+  bash "${FASTWAM_REPO}/scripts/pixi_run.sh" \
+    env "PYTHONPATH=${REPO_ROOT}/src" "$@"
+}
+
+echo "[prep] start=$(date -Is) host=$(hostname) job=${PBS_JOBID}"
+echo "[prep] pixi_manifest=${FASTWAM_REPO}/pyproject.toml"
+nvidia-smi
+
+echo "[prep] stage=environment"
+run_in_env python -u - <<'PY'
+from pathlib import Path
+
+import deepspeed
+import fasterwam
+import torch
+import torchvision
+
+assert torch.cuda.is_available()
+assert "H200" in torch.cuda.get_device_name(0)
+assert deepspeed.__version__ == "0.19.4", deepspeed.__version__
+module_path = Path(fasterwam.__file__).resolve()
+assert "/FasterWAM/src/fasterwam/" in str(module_path), module_path
+print(
+    f"torch={torch.__version__} cuda={torch.version.cuda} "
+    f"torchvision={torchvision.__version__} deepspeed={deepspeed.__version__} "
+    f"gpu={torch.cuda.get_device_name(0)} fasterwam={module_path}"
+)
+PY
+
+echo "[prep] stage=deepspeed_cpu_adam"
+run_in_env python -u scripts/prebuild_ds_ops.py
+
+echo "[prep] stage=text_embedding_cache"
+test -d "${REFERENCE_TEXT_CACHE}"
+cp -a --no-clobber "${REFERENCE_TEXT_CACHE}/." "${TEXT_CACHE}/"
+test "$(find "${TEXT_CACHE}" -maxdepth 1 -type f -name '*.pt' | wc -l)" -ge 1
+
+echo "[prep] stage=sparse_action_dit_initialization"
+if [[ -s "${ACTION_DIT_PATH}" ]]; then
+  echo "[prep] SparseActionDiT already exists; validating ${ACTION_DIT_PATH}"
+else
+  ACTION_DIT_TMP="${ACTION_DIT_PATH}.tmp-${PBS_JOBID}"
+  if [[ -e "${ACTION_DIT_TMP}" ]]; then
+    echo "[prep] Refusing to overwrite temporary file: ${ACTION_DIT_TMP}" >&2
+    exit 1
+  fi
+  run_in_env python -u scripts/preprocess_sparse_action_dit_backbone.py \
+    --model-config configs/model/fasterwam.yaml \
+    --output "${ACTION_DIT_TMP}" \
+    --device cuda \
+    --dtype bfloat16 \
+    --condition-layers 0,4,8,12,16,20,24,28 \
+    --apply-alpha-scaling true \
+    --redirect-common-files false
+  mv "${ACTION_DIT_TMP}" "${ACTION_DIT_PATH}"
+fi
+
+run_in_env python -u - "${ACTION_DIT_PATH}" <<'PY'
+import sys
+from pathlib import Path
+
+import torch
+
+path = Path(sys.argv[1])
+payload = torch.load(path, map_location="cpu", weights_only=True)
+state = payload["backbone_state_dict"]
+meta = payload["meta"]
+assert state
+assert meta["hidden_dim"] == 1024
+assert meta["num_layers"] == 30
+assert meta["num_heads"] == 24
+assert meta["noncondition_num_heads"] == 8
+assert meta["condition_layers"] == [0, 4, 8, 12, 16, 20, 24, 28]
+assert payload["policy"]["alpha_scaling"] is True
+print(f"SparseActionDiT validated: path={path} tensors={len(state)} meta={meta}")
+PY
+sha256sum "${ACTION_DIT_PATH}"
+
+echo "[prep] stage=dataset_stats_and_decode_validation"
+run_in_env python -u scripts/validate_widowxai_dataset.py \
+  --output-stats "${STATS_PATH}" \
+  --work-dir "${DATA_ROOT}/preparation/widowxai" \
+  --reference-stats "${REFERENCE_STATS}"
+
+test -s "${ACTION_DIT_PATH}"
+test -s "${STATS_PATH}"
+sha256sum "${STATS_PATH}"
+date -Is > "${READY_PATH}"
+echo "[prep] completed=$(date -Is) ready=${READY_PATH}"

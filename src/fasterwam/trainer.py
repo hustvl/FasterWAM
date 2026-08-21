@@ -3,6 +3,7 @@ import json
 import inspect
 import os
 import re
+import shutil
 from math import ceil
 from pathlib import Path
 import time
@@ -46,6 +47,8 @@ class Wan22Trainer:
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
+        keep_last_n_states = cfg.get("keep_last_n_states", None)
+        self.keep_last_n_states = None if keep_last_n_states is None else int(keep_last_n_states)
         
         self.resume = cfg.resume
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
@@ -55,6 +58,16 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+        self.setup_timings = {}
+        self.run_start_step = None
+        self.run_start_time = None
+        self.run_start_unix_time = None
+        self.last_timing_log_step = None
+        self.last_timing_log_time = None
+        self.latest_window_seconds_per_step = None
+        self.latest_window_steps_per_sec = None
+        self.evaluation_elapsed_seconds = 0.0
+        self.checkpoint_elapsed_seconds = 0.0
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -128,6 +141,30 @@ class Wan22Trainer:
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
         logger.info("Train/val dataset size: %d/%d", len(self.train_dataset), val_size)
 
+    def _prune_old_states(self, keep_step: int | None = None):
+        """Keep only the newest resumable ZeRO engine-state directories."""
+        if not self.keep_last_n_states or self.keep_last_n_states <= 0:
+            return
+        if not self.accelerator.is_main_process:
+            return
+
+        def step_of(path: Path) -> int:
+            match = re.search(r"step[_-](\d+)$", path.name)
+            return int(match.group(1)) if match else -1
+
+        state_dirs = [
+            path
+            for path in Path(self.state_dir).glob("step_*")
+            if path.is_dir() and step_of(path) >= 0
+        ]
+        state_dirs.sort(key=step_of)
+        stale = state_dirs[: max(len(state_dirs) - self.keep_last_n_states, 0)]
+        for path in stale:
+            if keep_step is not None and step_of(path) == keep_step:
+                continue
+            logger.info("[ckpt] pruning old training state: %s", path)
+            shutil.rmtree(path, ignore_errors=True)
+
     def _init_wandb(self):
         if not self.wandb_enabled or not self.accelerator.is_main_process:
             return
@@ -163,6 +200,149 @@ class Wan22Trainer:
             return
         self.wandb_run.finish()
         self.wandb_run = None
+
+    @staticmethod
+    def _format_duration(seconds: float | None) -> str | None:
+        if seconds is None:
+            return None
+        total_seconds = max(int(round(seconds)), 0)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    @staticmethod
+    def _local_timestamp(unix_time: float | None = None) -> str:
+        value = time.time() if unix_time is None else unix_time
+        return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(value))
+
+    def set_setup_timings(self, timings: dict):
+        self.setup_timings = {str(key): float(value) for key, value in timings.items()}
+        if not self.accelerator.is_main_process:
+            return
+
+        logger.info(
+            "[timing] model_init=%.2fs dataset_init=%.2fs trainer_init=%.2fs pre_train_total=%.2fs",
+            self.setup_timings.get("model_init_seconds", 0.0),
+            self.setup_timings.get("dataset_init_seconds", 0.0),
+            self.setup_timings.get("trainer_init_seconds", 0.0),
+            self.setup_timings.get("pre_train_total_seconds", 0.0),
+        )
+        self._wandb_log(
+            {
+                f"timing/setup_{key}": value
+                for key, value in self.setup_timings.items()
+            }
+        )
+
+    def _timing_payload(self, status: str) -> dict | None:
+        if self.run_start_time is None or self.run_start_step is None:
+            return None
+
+        now = time.perf_counter()
+        elapsed_seconds = max(now - self.run_start_time, 0.0)
+        completed_steps = max(int(self.global_step) - int(self.run_start_step), 0)
+        steps_per_sec = completed_steps / elapsed_seconds if elapsed_seconds > 0 and completed_steps > 0 else None
+        seconds_per_step = 1.0 / steps_per_sec if steps_per_sec else None
+        remaining_steps = max(int(self.max_steps) - int(self.global_step), 0)
+        estimated_remaining_seconds = remaining_steps / steps_per_sec if steps_per_sec else None
+        estimated_run_total_seconds = (
+            elapsed_seconds + estimated_remaining_seconds
+            if estimated_remaining_seconds is not None
+            else None
+        )
+        effective_global_batch_size = (
+            self.batch_size
+            * self.accelerator.num_processes
+            * self.gradient_accumulation_steps
+        )
+        estimated_completion_unix = (
+            time.time() + estimated_remaining_seconds
+            if estimated_remaining_seconds is not None
+            else None
+        )
+        train_loop_excluding_eval_checkpoint_seconds = max(
+            elapsed_seconds
+            - self.evaluation_elapsed_seconds
+            - self.checkpoint_elapsed_seconds,
+            0.0,
+        )
+
+        return {
+            "schema_version": 1,
+            "status": str(status),
+            "recorded_at": self._local_timestamp(),
+            "job": {
+                "pbs_job_id": os.environ.get("PBS_JOBID"),
+                "run_id": os.environ.get("RUN_ID"),
+                "host": os.environ.get("HOSTNAME"),
+                "world_size": int(self.accelerator.num_processes),
+            },
+            "setup": {key: round(value, 6) for key, value in self.setup_timings.items()},
+            "training": {
+                "started_at": self._local_timestamp(self.run_start_unix_time),
+                "run_start_step": int(self.run_start_step),
+                "current_global_step": int(self.global_step),
+                "target_global_step": int(self.max_steps),
+                "completed_optimizer_steps_this_run": completed_steps,
+                "remaining_optimizer_steps": remaining_steps,
+                "effective_global_batch_size": int(effective_global_batch_size),
+                "estimated_samples_this_run": int(completed_steps * effective_global_batch_size),
+                "elapsed_seconds": round(elapsed_seconds, 6),
+                "elapsed_hms": self._format_duration(elapsed_seconds),
+                "evaluation_seconds": round(self.evaluation_elapsed_seconds, 6),
+                "checkpoint_seconds": round(self.checkpoint_elapsed_seconds, 6),
+                "loop_excluding_eval_checkpoint_seconds": round(train_loop_excluding_eval_checkpoint_seconds, 6),
+                "average_steps_per_sec": None if steps_per_sec is None else round(steps_per_sec, 8),
+                "average_seconds_per_optimizer_step": None if seconds_per_step is None else round(seconds_per_step, 6),
+                "average_samples_per_sec": None if steps_per_sec is None else round(steps_per_sec * effective_global_batch_size, 6),
+                "latest_window_steps_per_sec": None if self.latest_window_steps_per_sec is None else round(self.latest_window_steps_per_sec, 8),
+                "latest_window_seconds_per_optimizer_step": None if self.latest_window_seconds_per_step is None else round(self.latest_window_seconds_per_step, 6),
+                "estimated_remaining_seconds": None if estimated_remaining_seconds is None else round(estimated_remaining_seconds, 6),
+                "estimated_remaining_hms": self._format_duration(estimated_remaining_seconds),
+                "estimated_run_total_seconds": None if estimated_run_total_seconds is None else round(estimated_run_total_seconds, 6),
+                "estimated_run_total_hms": self._format_duration(estimated_run_total_seconds),
+                "estimated_completion_at": None if estimated_completion_unix is None else self._local_timestamp(estimated_completion_unix),
+            },
+        }
+
+    def _write_timing_summary(self, status: str):
+        if not self.accelerator.is_main_process:
+            return
+        payload = self._timing_payload(status=status)
+        if payload is None:
+            return
+        timing_path = Path(self.output_dir) / "timing.json"
+        temporary_path = timing_path.with_suffix(".json.tmp")
+        try:
+            with open(temporary_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=True, indent=2)
+                f.write("\n")
+            os.replace(temporary_path, timing_path)
+        except OSError:
+            logger.exception("Failed to update timing summary: %s", timing_path)
+
+    def finalize_training(self, status: str):
+        if self.accelerator.is_main_process and self.run_start_time is not None:
+            payload = self._timing_payload(status=status)
+            if payload is not None:
+                training = payload["training"]
+                logger.info(
+                    "[timing] status=%s train_elapsed=%s avg_sec_per_step=%s avg_samples_per_sec=%s output=%s",
+                    status,
+                    training["elapsed_hms"],
+                    training["average_seconds_per_optimizer_step"],
+                    training["average_samples_per_sec"],
+                    Path(self.output_dir) / "timing.json",
+                )
+                final_metrics = {
+                    "timing/train_elapsed_seconds": training["elapsed_seconds"],
+                }
+                if training["average_seconds_per_optimizer_step"] is not None:
+                    final_metrics["timing/average_seconds_per_optimizer_step"] = training["average_seconds_per_optimizer_step"]
+                    final_metrics["timing/average_samples_per_sec"] = training["average_samples_per_sec"]
+                self._wandb_log(final_metrics)
+            self._write_timing_summary(status=status)
+        self._finish_wandb()
 
     def _build_loader(self, dataset, worker_init_fn=None):
         self.train_sampler = ResumableEpochSampler(
@@ -595,6 +775,8 @@ class Wan22Trainer:
         if self.accelerator.is_main_process:
             self._save_trainer_state(state_path)
         self.accelerator.wait_for_everyone()
+        self._prune_old_states(keep_step=self.global_step)
+        self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
 
@@ -655,6 +837,10 @@ class Wan22Trainer:
         data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
+        self.run_start_unix_time = time.time()
+        self.last_timing_log_step = self.global_step
+        self.last_timing_log_time = self.run_start_time
+        self._write_timing_summary(status="running")
 
         while self.global_step < self.max_steps:
             try:
@@ -690,13 +876,29 @@ class Wan22Trainer:
                         global_loss_metrics[key] = float(
                             self.accelerator.gather(metric_tensor).mean().item()
                         )
+                    # DeepSpeed clips internally and may return None while it
+                    # reports no norm for a completed engine step.
+                    if grad_norm is None:
+                        grad_norm = float("nan")
                     grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
                     global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
 
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
 
                     if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
+                        timing_now = time.perf_counter()
+                        window_steps = self.global_step - self.last_timing_log_step
+                        window_seconds = max(timing_now - self.last_timing_log_time, 1e-9)
+                        self.latest_window_steps_per_sec = window_steps / window_seconds
+                        self.latest_window_seconds_per_step = (
+                            window_seconds / window_steps if window_steps > 0 else None
+                        )
+                        self.last_timing_log_step = self.global_step
+                        self.last_timing_log_time = timing_now
+
                         eta_str, steps_per_sec = self._estimate_eta()
+                        elapsed_seconds = time.perf_counter() - self.run_start_time
+                        seconds_per_step = 1.0 / max(steps_per_sec, 1e-9)
                         description = "[train] epoch=%d step=%d/%d loss=%.4f " % (
                             self.epoch,
                             self.global_step,
@@ -706,10 +908,19 @@ class Wan22Trainer:
                         if global_loss_metrics:
                             detail_str = " ".join([f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())])
                             description += detail_str + " "
-                        description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
+                        samples_per_sec = (
+                            steps_per_sec
+                            * self.batch_size
+                            * self.accelerator.num_processes
+                            * self.gradient_accumulation_steps
+                        )
+                        description += "lr=%.2e speed=%.2f step/s, %.2f samples/s sec/step=%.3f window_sec/step=%.3f elapsed=%s eta=%s" % (
                             current_lr,
                             steps_per_sec,
-                            steps_per_sec * self.batch_size * self.accelerator.num_processes,
+                            samples_per_sec,
+                            seconds_per_step,
+                            self.latest_window_seconds_per_step,
+                            self._format_duration(elapsed_seconds),
                             eta_str,
                         )
                         logger.info(description)
@@ -719,19 +930,27 @@ class Wan22Trainer:
                             "train/grad_norm": global_grad_norm,
                             "train/lr": current_lr,
                             "performance/steps_per_sec": steps_per_sec,
-                            "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
+                            "performance/samples_per_sec": samples_per_sec,
+                            "performance/window_steps_per_sec": self.latest_window_steps_per_sec,
+                            "timing/train_elapsed_seconds": elapsed_seconds,
+                            "timing/seconds_per_optimizer_step": seconds_per_step,
+                            "timing/window_seconds_per_optimizer_step": self.latest_window_seconds_per_step,
+                            "timing/estimated_remaining_seconds": max(self.max_steps - self.global_step, 0) * seconds_per_step,
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
                         self._wandb_log(wandb_payload)
+                        self._write_timing_summary(status="running")
 
                     if (
                         self.eval_every > 0
                         and self.val_dataset is not None
                         and self.global_step % self.eval_every == 0
                     ):
+                        evaluation_start = time.perf_counter()
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
+                        self.evaluation_elapsed_seconds += time.perf_counter() - evaluation_start
                         if metrics is not None and self.accelerator.is_main_process:
                             description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
                                 self.global_step,
@@ -759,8 +978,11 @@ class Wan22Trainer:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
                             self._wandb_log(eval_payload)
 
+                    ckpt_info = None
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
+                        checkpoint_start = time.perf_counter()
                         ckpt_info = self.save_checkpoint()
+                        self.checkpoint_elapsed_seconds += time.perf_counter() - checkpoint_start
                         if self.accelerator.is_main_process:
                             logger.info(
                                 "[ckpt] step=%d weights=%s state=%s",
@@ -770,7 +992,10 @@ class Wan22Trainer:
                             )
 
                     if self.global_step >= self.max_steps:
-                        ckpt_info = self.save_checkpoint()
+                        if ckpt_info is None:
+                            checkpoint_start = time.perf_counter()
+                            ckpt_info = self.save_checkpoint()
+                            self.checkpoint_elapsed_seconds += time.perf_counter() - checkpoint_start
                         if self.accelerator.is_main_process:
                             logger.info(
                                 "[done] max_steps reached step=%d weights=%s state=%s",
@@ -780,7 +1005,9 @@ class Wan22Trainer:
                             )
                         return
 
+        checkpoint_start = time.perf_counter()
         ckpt_info = self.save_checkpoint()
+        self.checkpoint_elapsed_seconds += time.perf_counter() - checkpoint_start
         if self.accelerator.is_main_process:
             logger.info(
                 "[done] training finished step=%d weights=%s state=%s",

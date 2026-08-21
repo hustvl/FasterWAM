@@ -102,3 +102,77 @@ class RelativeJointTransform:
             batch["action"][k] = batch["action"][k] + batch["state"][k][..., :1, :]
         
         return batch
+
+
+class MaskedRelativeJointTransform:
+    """Rebase selected action dimensions while leaving the rest absolute.
+
+    ``dim_masks`` maps each action key to one boolean per action dimension.
+    True dimensions are made relative to the state at the first observation
+    frame; False dimensions (WidowXAI grippers) remain absolute.
+
+    This transform runs before normalization. Do not combine it with
+    ``delta_action_dim_mask`` for absolute joint targets: end-of-episode
+    padding must replicate the last target before it is rebased.
+    """
+
+    def __init__(self, dim_masks: Dict[str, List[bool]]):
+        if not dim_masks:
+            raise ValueError("`dim_masks` must not be empty.")
+        self.dim_masks = {
+            key: torch.as_tensor(list(mask), dtype=torch.bool)
+            for key, mask in dim_masks.items()
+        }
+        for key, mask in self.dim_masks.items():
+            if mask.ndim != 1:
+                raise ValueError(
+                    f"`dim_masks[{key}]` must be 1-D, got shape {tuple(mask.shape)}."
+                )
+
+    def _base(self, batch: Dict, key: str, mask: torch.Tensor) -> torch.Tensor:
+        if key not in batch["state"]:
+            raise KeyError(
+                f"State key '{key}' is required to rebase actions; "
+                f"available keys: {sorted(batch['state'].keys())}"
+            )
+        state = batch["state"][key]
+        action = batch["action"][key]
+        if action.shape[-1] != mask.shape[0]:
+            raise ValueError(
+                f"`dim_masks[{key}]` has length {mask.shape[0]} but action has "
+                f"{action.shape[-1]} dimensions."
+            )
+        if state.shape[-1] != action.shape[-1]:
+            raise ValueError(
+                f"State '{key}' has {state.shape[-1]} dims but action has "
+                f"{action.shape[-1]}."
+            )
+        return state[..., :1, :]
+
+    def _assert_covers(self, batch: Dict) -> None:
+        missing = sorted(set(batch["action"].keys()) - set(self.dim_masks.keys()))
+        if missing:
+            raise ValueError(
+                f"`dim_masks` is missing action key(s) {missing}; "
+                f"got {sorted(self.dim_masks.keys())}."
+            )
+
+    def forward(self, batch: Dict):
+        if "action" not in batch:
+            return batch
+        self._assert_covers(batch)
+        for key, mask in self.dim_masks.items():
+            action = batch["action"][key]
+            base = self._base(batch, key, mask)
+            dim_mask = mask.to(device=action.device)
+            batch["action"][key] = torch.where(dim_mask, action - base, action)
+        return batch
+
+    def backward(self, batch: Dict):
+        self._assert_covers(batch)
+        for key, mask in self.dim_masks.items():
+            action = batch["action"][key]
+            base = self._base(batch, key, mask)
+            dim_mask = mask.to(device=action.device)
+            batch["action"][key] = torch.where(dim_mask, action + base, action)
+        return batch

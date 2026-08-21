@@ -12,6 +12,8 @@ runs/
 LIBERO/
 .libero/
 logs/
+*.o[0-9]*
+*.e[0-9]*
 evaluate_results
 evaluate_results/
 .deepspeed*

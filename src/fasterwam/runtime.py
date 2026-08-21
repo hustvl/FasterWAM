@@ -1,6 +1,7 @@
 import logging
 import os
 import inspect
+import time
 from pathlib import Path
 
 import torch
@@ -366,6 +367,7 @@ def _resolve_train_device() -> str:
 
 
 def run_training(cfg: DictConfig):
+    pipeline_start_time = time.perf_counter()
     setup_logging(
         log_level=logging.INFO,
         is_main_process=torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True,
@@ -378,16 +380,46 @@ def run_training(cfg: DictConfig):
     model_device = _resolve_train_device()
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
-    model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
-    train_ds, val_ds = build_datasets(cfg.data)
 
+    model_init_start = time.perf_counter()
+    model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
+    model_init_seconds = time.perf_counter() - model_init_start
+
+    dataset_init_start = time.perf_counter()
+    train_ds, val_ds = build_datasets(cfg.data)
+    dataset_init_seconds = time.perf_counter() - dataset_init_start
+
+    trainer_init_start = time.perf_counter()
     trainer = Wan22Trainer(
         cfg=cfg,
         model=model,
         train_dataset=train_ds,
         val_dataset=val_ds,
     )
-    trainer.train()
+    trainer_init_seconds = time.perf_counter() - trainer_init_start
+    trainer.set_setup_timings(
+        {
+            "model_init_seconds": model_init_seconds,
+            "dataset_init_seconds": dataset_init_seconds,
+            "trainer_init_seconds": trainer_init_seconds,
+            "pre_train_total_seconds": time.perf_counter() - pipeline_start_time,
+        }
+    )
+
+    status = "failed"
+    try:
+        trainer.train()
+        status = "completed"
+    except KeyboardInterrupt:
+        status = "interrupted"
+        raise
+    finally:
+        try:
+            trainer.finalize_training(status=status)
+        except Exception:
+            # Timing/W&B teardown must not hide a training exception or turn a
+            # successfully checkpointed run into a failed PBS job.
+            logger.exception("Failed to finalize timing/W&B for training status=%s.", status)
 
 def run_inference(cfg: DictConfig):
     setup_logging(log_level=logging.INFO)
