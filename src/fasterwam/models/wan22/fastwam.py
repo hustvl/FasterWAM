@@ -272,11 +272,14 @@ class FastWAM(torch.nn.Module):
         ids = ids.to(self.device)
         mask = mask.to(self.device, dtype=torch.bool)
         prompt_emb = self.text_encoder(ids, mask)
-        # FIXME: original implementation's zero padding is visible in cross-attn.
-        seq_lens = mask.gt(0).sum(dim=1).long()
-        for i, v in enumerate(seq_lens):
-            prompt_emb[i, v:] = 0
-        mask = torch.ones_like(mask)
+        if prompt_emb.ndim != 3 or prompt_emb.shape[:2] != mask.shape:
+            raise ValueError(
+                "Text encoder output must have shape [B, L, D] matching the "
+                f"token mask [B, L], got {tuple(prompt_emb.shape)} and {tuple(mask.shape)}."
+            )
+        # Keep both representations consistent: zero padded embeddings must not
+        # participate in cross-attention, while valid tokens retain their values.
+        prompt_emb = prompt_emb.masked_fill(~mask.unsqueeze(-1), 0)
         return prompt_emb.to(device=self.device), mask
 
     def _append_proprio_to_context(
