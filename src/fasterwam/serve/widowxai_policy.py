@@ -19,6 +19,7 @@ from omegaconf import DictConfig, OmegaConf
 from fasterwam.datasets.dataset_utils import CenterCrop, Normalize, ResizeSmallestSideAspectPreserving
 from fasterwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fasterwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from fasterwam.models.wan22.rtc import RTCConfig, RTCGuidance
 from fasterwam.runtime import _mixed_precision_to_model_dtype, _normalize_mixed_precision
 
 DEFAULT_RUN_DIR = Path(
@@ -280,6 +281,35 @@ class WidowXAIOnlinePreprocessor:
     def prepare_observation(self, obs: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
         return self.prepare_image(dict(obs.get("images", {}))), self.prepare_proprio(obs["qpos"])
 
+    def normalize_previous_actions(self, actions: Any, qpos: Any) -> torch.Tensor:
+        """Rebase physical targets on *this* observation with the training pipeline.
+
+        Pad before normalization to support stepwise statistics. The returned
+        prefix retains its valid length; padding never participates in guidance.
+        """
+        actions = np.asarray(actions, dtype=np.float32)
+        state = np.asarray(qpos, dtype=np.float32)
+        if actions.ndim != 2 or actions.shape[1] != self.action_dim or len(actions) > self.action_horizon:
+            raise ValueError("previous_actions must have shape [L,14], L <= action_horizon")
+        if state.shape != (self.action_dim,) or not np.isfinite(state).all() or not np.isfinite(actions).all():
+            raise ValueError("Invalid physical prefix or current qpos")
+        length = len(actions)
+        if not length:
+            return torch.empty((0, self.action_dim), dtype=torch.float32)
+        padded = np.repeat(actions[-1:], self.action_horizon, axis=0)
+        padded[:length] = actions
+        batch = {
+            "action": {"default": torch.from_numpy(padded)},
+            "state": {"default": torch.from_numpy(state.copy()).reshape(1, self.action_dim)},
+        }
+        batch = self.processor.action_state_transform(batch)
+        batch = self.processor.normalizer.forward(batch)
+        batch = self.processor.action_state_merger.forward(batch)
+        result = batch["action"][:length].to(dtype=torch.float32).contiguous()
+        if tuple(result.shape) != (length, self.action_dim) or not torch.isfinite(result).all():
+            raise ValueError("Training transforms produced invalid RTC prefix")
+        return result
+
     def denormalize_action(
         self,
         normalized_action: torch.Tensor,
@@ -316,6 +346,7 @@ class WidowXAIFasterWAMPolicy:
 
     history_tail_len = 0
     action_dim = 14
+    supports_chunk_context = True
     def __init__(
         self,
         run_dir: str | Path = DEFAULT_RUN_DIR,
@@ -329,7 +360,10 @@ class WidowXAIFasterWAMPolicy:
         action_infer_mode: str | None = None,
         seed: int = 42,
         control_fps: float | None = None,
+        rtc_config: RTCConfig | None = None,
     ) -> None:
+        self.rtc_config = rtc_config or RTCConfig()
+        self.supports_rtc = self.rtc_config.enabled
         self.artifacts = resolve_run_artifacts(
             run_dir=run_dir,
             config_path=config_path,
@@ -410,6 +444,8 @@ class WidowXAIFasterWAMPolicy:
                 f"Configured model {type(self.model).__name__} does not support "
                 f"action mode {self.action_infer_mode!r}"
             )
+        if self.supports_rtc and "rtc_guidance" not in inspect.signature(infer_fn).parameters:
+            raise TypeError(f"{self.action_infer_mode} does not accept rtc_guidance")
         return infer_fn
 
     def _training_fps(self) -> float:
@@ -458,6 +494,7 @@ class WidowXAIFasterWAMPolicy:
         self,
         obs: dict[str, Any],
         history: dict[str, Any] | None = None,
+        *, chunk_context: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, str, bool]:
         del history
         input_image, proprio = self.preprocessor.prepare_observation(obs)
@@ -479,6 +516,18 @@ class WidowXAIFasterWAMPolicy:
         }
         signature = inspect.signature(self._infer_fn)
         kwargs = {name: value for name, value in kwargs.items() if name in signature.parameters}
+        if chunk_context is not None and chunk_context["guidance_method"] == "rtc":
+            if not self.supports_rtc:
+                raise ValueError("RTC is disabled by serving configuration")
+            # Do not let the legacy signature filter silently remove RTC arguments.
+            if "rtc_guidance" not in signature.parameters:
+                raise TypeError("Inference path cannot accept RTC guidance")
+            previous = self.preprocessor.normalize_previous_actions(
+                chunk_context["previous_actions"], obs["qpos"],
+            )
+            kwargs["rtc_guidance"] = RTCGuidance(
+                previous.unsqueeze(0), chunk_context["inference_delay_steps"], self.rtc_config,
+            )
         prediction = self._infer_fn(**kwargs)
         action = self.preprocessor.denormalize_action(prediction["action"], proprio)
         return action, "FASTERWAM", False

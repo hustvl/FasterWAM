@@ -1,0 +1,10 @@
+# Explicit opt-in serving file; training config/checkpoints are unchanged.
+# CLI > this file (only when selected) > serving defaults/training inference defaults.
+rtc:
+  enabled: true
+  prefix_attention_schedule: exp
+  max_guidance_weight: 5.0
+action_infer_mode: one_pass_future_cache  # or joint_rollout
+num_inference_steps: 10
+seed: 42
+control_fps: null                       # dataset fps; client must use server control_dt

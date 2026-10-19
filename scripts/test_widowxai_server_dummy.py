@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
-import sys
+import argparse
 import io
+import os
+import sys
 import threading
 from pathlib import Path
 
@@ -13,14 +15,15 @@ from PIL import Image
 
 from fasterwam.serve.websocket_server import WebsocketPolicyServer
 
-CLIENT_SCRIPTS = Path(
-    "/home/user128004/gitrepo/sbr-wm-deploy/trossen_ai_aloha/scripts"
-)
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--client-scripts", type=Path, default=os.environ.get("SBR_CLIENT_SCRIPTS"))
+args = parser.parse_args()
+CLIENT_SCRIPTS = args.client_scripts or Path(__file__).resolve().parents[2] / "sbr-wm-deploy/trossen_ai_aloha/scripts"
 if not CLIENT_SCRIPTS.is_dir():
     raise FileNotFoundError(f"sbr-wm-deploy client scripts not found: {CLIENT_SCRIPTS}")
 sys.path.insert(0, str(CLIENT_SCRIPTS))
-from policy.remote.websocket_client_policy import WebsocketClientPolicy  # noqa: E402
 from policy.remote import serialization as client_serialization  # noqa: E402
+from policy.remote.websocket_client_policy import WebsocketClientPolicy  # noqa: E402
 
 
 def _pillow_encode_jpeg(image: np.ndarray, quality: int = 90) -> dict[str, bytes]:
@@ -143,6 +146,20 @@ def run_client(port: int, policy: DummyTopViewFreePolicy, codec: str) -> None:
             assert summary["shape"] == [480, 640, 3], summary
             assert summary["dtype"] == "uint8", summary
 
+        assert metadata["supports_timed_chunks"] and not metadata["supports_rtc"]
+        context = {"episode_id": "dummy-episode", "request_id": 7, "observation_step": 11,
+                       "control_dt": policy.control_dt, "previous_actions": action[:8].copy(),
+                       "inference_delay_steps": 2, "guidance_method": "none"}
+        timed, _, _ = client.select_action({"qpos": qpos, "images": images}, chunk_context=context)
+        np.testing.assert_array_equal(timed, action)
+        assert client.last_chunk_context == {key: context[key] for key in (
+            "episode_id", "request_id", "observation_step")}
+        try:
+            client.require_guidance("rtc")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("RTC must fail before robot initialization")
         if codec == "raw":
             client.reset()
 

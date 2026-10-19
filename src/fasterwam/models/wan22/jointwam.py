@@ -5,6 +5,7 @@ import torch
 from fasterwam.utils.logging_config import get_logger
 
 from .fastwam import FastWAM
+from .rtc import RTCGuidance, rtc_corrected_flow
 
 logger = get_logger(__name__)
 
@@ -134,8 +135,11 @@ class JointWAM(FastWAM):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        rtc_guidance: RTCGuidance | None = None,
     ) -> dict[str, Any]:
         self.eval()
+        if rtc_guidance is not None and any(parameter.requires_grad for parameter in self.parameters()):
+            raise ValueError("RTC inference requires frozen model parameters")
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
@@ -241,16 +245,35 @@ class JointWAM(FastWAM):
             timestep_video = step_t_video.unsqueeze(0).to(dtype=latents_video.dtype, device=self.device)
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-            pred_video_posi, pred_action_posi = self._predict_joint_noise(
-                latents_video=latents_video,
-                latents_action=latents_action,
-                timestep_video=timestep_video,
-                timestep_action=timestep_action,
-                context=context,
-                context_mask=context_mask,
-                fuse_vae_embedding_in_latents=fuse_flag,
-                gt_action=None,
-            )
+            if rtc_guidance is None:
+                pred_video_posi, pred_action_posi = self._predict_joint_noise(
+                    latents_video=latents_video,
+                    latents_action=latents_action,
+                    timestep_video=timestep_video,
+                    timestep_action=timestep_action,
+                    context=context,
+                    context_mask=context_mask,
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                    gt_action=None,
+                )
+            else:
+                def predict_action(
+                    action, latents_video=latents_video,
+                    timestep_video=timestep_video, timestep_action=timestep_action,
+                ):
+                    video, flow = self._predict_joint_noise_differentiable(
+                        latents_video=latents_video, latents_action=action,
+                        timestep_video=timestep_video, timestep_action=timestep_action,
+                        context=context, context_mask=context_mask,
+                        fuse_vae_embedding_in_latents=fuse_flag, gt_action=None,
+                    )
+                    return flow, video
+
+                pred_action_posi, pred_video_posi = rtc_corrected_flow(
+                    predict_action, latents_action,
+                    step_t_action.float() / self.infer_action_scheduler.num_train_timesteps,
+                    rtc_guidance,
+                )
 
             latents_video = self.infer_video_scheduler.step(pred_video_posi, step_delta_video, latents_video)
             latents_action = self.infer_action_scheduler.step(pred_action_posi, step_delta_action, latents_action)
@@ -277,9 +300,12 @@ class JointWAM(FastWAM):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        rtc_guidance: RTCGuidance | None = None,
     ) -> dict[str, Any]:
         del negative_prompt, text_cfg_scale
         self.eval()
+        if rtc_guidance is not None and any(parameter.requires_grad for parameter in self.parameters()):
+            raise ValueError("RTC inference requires frozen model parameters")
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
@@ -410,15 +436,31 @@ class JointWAM(FastWAM):
         )
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
-            pred_action_posi = self._predict_action_noise_with_cache(
-                latents_action=latents_action,
-                timestep_action=timestep_action,
-                context=context,
-                context_mask=context_mask,
-                video_kv_cache=video_kv_cache,
-                attention_mask=attention_masks,
-                video_seq_len=video_seq_len,
-            )
+            if rtc_guidance is None:
+                pred_action_posi = self._predict_action_noise_with_cache(
+                    latents_action=latents_action,
+                    timestep_action=timestep_action,
+                    context=context,
+                    context_mask=context_mask,
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_masks,
+                    video_seq_len=video_seq_len,
+                )
+            else:
+                def predict_action(action, timestep_action=timestep_action):
+                    flow = self._predict_action_noise_with_cache_differentiable(
+                        latents_action=action, timestep_action=timestep_action,
+                        context=context, context_mask=context_mask,
+                        video_kv_cache=video_kv_cache, attention_mask=attention_masks,
+                        video_seq_len=video_seq_len,
+                    )
+                    return flow, None
+
+                pred_action_posi, _ = rtc_corrected_flow(
+                    predict_action, latents_action,
+                    step_t_action.float() / self.infer_action_scheduler.num_train_timesteps,
+                    rtc_guidance,
+                )
             latents_action = self.infer_action_scheduler.step(pred_action_posi, step_delta_action, latents_action)
 
         return {

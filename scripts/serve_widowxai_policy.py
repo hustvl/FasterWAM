@@ -8,6 +8,9 @@ import os
 import socket
 from pathlib import Path
 
+import yaml
+
+from fasterwam.models.wan22.rtc import RTCConfig
 from fasterwam.serve import WebsocketPolicyServer, WidowXAIFasterWAMPolicy
 from fasterwam.serve.widowxai_policy import (
     ACTION_INFER_MODES,
@@ -32,14 +35,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument("--action-infer-mode", choices=ACTION_INFER_MODES, default=None)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--control-fps", type=float, default=None)
     parser.add_argument(
         "--allow-download",
         action="store_true",
         help="Allow missing Wan base weights to be downloaded instead of failing locally.",
     )
-    return parser.parse_args()
+    parser.add_argument("--serving-config", type=Path, default=None,
+                        help="Serving overrides, independent of the resolved training --config.")
+    parser.add_argument("--rtc", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--rtc-prefix-schedule", choices=["exp", "linear", "ones", "zeros"], default=None)
+    parser.add_argument("--rtc-max-guidance-weight", type=float, default=None)
+    args = parser.parse_args()
+    settings = {}
+    if args.serving_config is not None:
+        with args.serving_config.open(encoding="utf-8") as stream:
+            settings = yaml.safe_load(stream) or {}
+        if not isinstance(settings, dict) or set(settings) - {
+            "rtc", "action_infer_mode", "num_inference_steps", "seed", "control_fps"
+        }:
+            parser.error("Unknown serving configuration fields")
+    rtc = settings.get("rtc", {})
+    if not isinstance(rtc, dict) or set(rtc) - {"enabled", "prefix_attention_schedule", "max_guidance_weight"}:
+        parser.error("Unknown RTC configuration fields")
+    args.rtc_config = RTCConfig(
+        enabled=args.rtc if args.rtc is not None else rtc.get("enabled", False),
+        prefix_attention_schedule=args.rtc_prefix_schedule or rtc.get("prefix_attention_schedule", "exp"),
+        max_guidance_weight=(args.rtc_max_guidance_weight if args.rtc_max_guidance_weight is not None
+                             else rtc.get("max_guidance_weight", 5.0)),
+    )
+    for key in ("action_infer_mode", "num_inference_steps", "seed", "control_fps"):
+        if getattr(args, key) is None:
+            setattr(args, key, settings.get(key, 42 if key == "seed" else None))
+    return args
 
 
 def main() -> None:
@@ -54,6 +83,7 @@ def main() -> None:
         checkpoint_path=args.checkpoint,
         norm_stats_path=args.norm_stats,
     )
+    print(f"[serve-widowxai] rtc={args.rtc_config} seed={args.seed}", flush=True)
     hostname = socket.gethostname()
     print(f"[serve-widowxai] node={hostname}", flush=True)
     print(f"[serve-widowxai] run_dir={artifacts.run_dir}", flush=True)
@@ -77,6 +107,7 @@ def main() -> None:
         action_infer_mode=args.action_infer_mode,
         seed=args.seed,
         control_fps=args.control_fps,
+        rtc_config=args.rtc_config,
     )
     print(
         "[serve-widowxai] visual_input="
