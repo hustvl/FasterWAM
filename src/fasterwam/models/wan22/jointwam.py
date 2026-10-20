@@ -6,6 +6,7 @@ from fasterwam.utils.logging_config import get_logger
 
 from .fastwam import FastWAM
 from .rtc import RTCGuidance, rtc_corrected_flow
+from .simple import SimpleGuidance, simple_denoise_step
 
 logger = get_logger(__name__)
 
@@ -136,10 +137,15 @@ class JointWAM(FastWAM):
         rand_device: str = "cpu",
         tiled: bool = False,
         rtc_guidance: RTCGuidance | None = None,
+        simple_guidance: SimpleGuidance | None = None,
     ) -> dict[str, Any]:
         self.eval()
-        if rtc_guidance is not None and any(parameter.requires_grad for parameter in self.parameters()):
-            raise ValueError("RTC inference requires frozen model parameters")
+        if rtc_guidance is not None and simple_guidance is not None:
+            raise ValueError("rtc_guidance and simple_guidance are mutually exclusive")
+        if (rtc_guidance is not None or simple_guidance is not None) and any(
+            parameter.requires_grad for parameter in self.parameters()
+        ):
+            raise ValueError("Guided inference requires frozen model parameters")
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
@@ -276,7 +282,14 @@ class JointWAM(FastWAM):
                 )
 
             latents_video = self.infer_video_scheduler.step(pred_video_posi, step_delta_video, latents_video)
-            latents_action = self.infer_action_scheduler.step(pred_action_posi, step_delta_action, latents_action)
+            next_latents_action = self.infer_action_scheduler.step(pred_action_posi, step_delta_action, latents_action)
+            if simple_guidance is not None:
+                next_latents_action = simple_denoise_step(
+                    latents_action, pred_action_posi, next_latents_action,
+                    step_t_action.float() / self.infer_action_scheduler.num_train_timesteps,
+                    step_delta_action, simple_guidance,
+                )
+            latents_action = next_latents_action
             latents_video[:, :, 0:1] = first_frame_latents.clone()
 
         return {
@@ -301,11 +314,16 @@ class JointWAM(FastWAM):
         rand_device: str = "cpu",
         tiled: bool = False,
         rtc_guidance: RTCGuidance | None = None,
+        simple_guidance: SimpleGuidance | None = None,
     ) -> dict[str, Any]:
         del negative_prompt, text_cfg_scale
         self.eval()
-        if rtc_guidance is not None and any(parameter.requires_grad for parameter in self.parameters()):
-            raise ValueError("RTC inference requires frozen model parameters")
+        if rtc_guidance is not None and simple_guidance is not None:
+            raise ValueError("rtc_guidance and simple_guidance are mutually exclusive")
+        if (rtc_guidance is not None or simple_guidance is not None) and any(
+            parameter.requires_grad for parameter in self.parameters()
+        ):
+            raise ValueError("Guided inference requires frozen model parameters")
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
@@ -461,7 +479,14 @@ class JointWAM(FastWAM):
                     step_t_action.float() / self.infer_action_scheduler.num_train_timesteps,
                     rtc_guidance,
                 )
-            latents_action = self.infer_action_scheduler.step(pred_action_posi, step_delta_action, latents_action)
+            next_latents_action = self.infer_action_scheduler.step(pred_action_posi, step_delta_action, latents_action)
+            if simple_guidance is not None:
+                next_latents_action = simple_denoise_step(
+                    latents_action, pred_action_posi, next_latents_action,
+                    step_t_action.float() / self.infer_action_scheduler.num_train_timesteps,
+                    step_delta_action, simple_guidance,
+                )
+            latents_action = next_latents_action
 
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),

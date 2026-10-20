@@ -20,6 +20,7 @@ from fasterwam.datasets.dataset_utils import CenterCrop, Normalize, ResizeSmalle
 from fasterwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fasterwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fasterwam.models.wan22.rtc import RTCConfig, RTCGuidance
+from fasterwam.models.wan22.simple import SimpleConfig, SimpleGuidance
 from fasterwam.runtime import _mixed_precision_to_model_dtype, _normalize_mixed_precision
 
 DEFAULT_RUN_DIR = Path(
@@ -307,7 +308,7 @@ class WidowXAIOnlinePreprocessor:
         batch = self.processor.action_state_merger.forward(batch)
         result = batch["action"][:length].to(dtype=torch.float32).contiguous()
         if tuple(result.shape) != (length, self.action_dim) or not torch.isfinite(result).all():
-            raise ValueError("Training transforms produced invalid RTC prefix")
+            raise ValueError("Training transforms produced invalid normalized prefix")
         return result
 
     def denormalize_action(
@@ -361,9 +362,12 @@ class WidowXAIFasterWAMPolicy:
         seed: int = 42,
         control_fps: float | None = None,
         rtc_config: RTCConfig | None = None,
+        simple_config: SimpleConfig | None = None,
     ) -> None:
         self.rtc_config = rtc_config or RTCConfig()
         self.supports_rtc = self.rtc_config.enabled
+        self.simple_config = simple_config or SimpleConfig()
+        self.supports_simple = self.simple_config.enabled
         self.artifacts = resolve_run_artifacts(
             run_dir=run_dir,
             config_path=config_path,
@@ -446,6 +450,8 @@ class WidowXAIFasterWAMPolicy:
             )
         if self.supports_rtc and "rtc_guidance" not in inspect.signature(infer_fn).parameters:
             raise TypeError(f"{self.action_infer_mode} does not accept rtc_guidance")
+        if self.supports_simple and "simple_guidance" not in inspect.signature(infer_fn).parameters:
+            raise TypeError(f"{self.action_infer_mode} does not accept simple_guidance")
         return infer_fn
 
     def _training_fps(self) -> float:
@@ -516,17 +522,23 @@ class WidowXAIFasterWAMPolicy:
         }
         signature = inspect.signature(self._infer_fn)
         kwargs = {name: value for name, value in kwargs.items() if name in signature.parameters}
-        if chunk_context is not None and chunk_context["guidance_method"] == "rtc":
-            if not self.supports_rtc:
-                raise ValueError("RTC is disabled by serving configuration")
-            # Do not let the legacy signature filter silently remove RTC arguments.
-            if "rtc_guidance" not in signature.parameters:
-                raise TypeError("Inference path cannot accept RTC guidance")
+        method = chunk_context["guidance_method"] if chunk_context is not None else "none"
+        if method not in ("none", "rtc", "simple"):
+            raise ValueError(f"Unknown guidance_method: {method}")
+        if method != "none":
+            if not getattr(self, f"supports_{method}", False):
+                raise ValueError(f"{method} is disabled by serving configuration")
+            # Add guidance after the legacy filter; never silently drop it.
+            keyword = f"{method}_guidance"
+            if keyword not in signature.parameters:
+                raise TypeError(f"Inference path cannot accept {method} guidance")
             previous = self.preprocessor.normalize_previous_actions(
                 chunk_context["previous_actions"], obs["qpos"],
             )
-            kwargs["rtc_guidance"] = RTCGuidance(
-                previous.unsqueeze(0), chunk_context["inference_delay_steps"], self.rtc_config,
+            guidance_type = RTCGuidance if method == "rtc" else SimpleGuidance
+            kwargs[keyword] = guidance_type(
+                previous.unsqueeze(0), chunk_context["inference_delay_steps"],
+                getattr(self, f"{method}_config"),
             )
         prediction = self._infer_fn(**kwargs)
         action = self.preprocessor.denormalize_action(prediction["action"], proprio)

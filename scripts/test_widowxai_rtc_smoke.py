@@ -1,4 +1,4 @@
-"""Short real-checkpoint smoke for both paths, RTC off/on; no robot or downloads.
+"""Real-checkpoint smoke for both paths, none/rtc/simple; no robot or downloads.
 
 Use the serving CLI arguments plus --output-dir (must not already exist).
 Writes configuration/artifact identities, timings and finite-output checks.
@@ -45,6 +45,7 @@ def main():
     os.environ["DIFFSYNTH_MODEL_BASE_PATH"] = str(args.model_base_path.resolve())
     os.environ["DIFFSYNTH_SKIP_DOWNLOAD"] = "true"
     rtc = dataclasses.replace(args.rtc_config, enabled=True)
+    simple = dataclasses.replace(args.simple_config, enabled=True)
     policy = WidowXAIFasterWAMPolicy(
         run_dir=args.run_dir,
         config_path=args.config,
@@ -58,6 +59,7 @@ def main():
         seed=args.seed,
         control_fps=args.control_fps,
         rtc_config=rtc,
+        simple_config=simple,
     )
     report = {
         "seed": args.seed,
@@ -65,6 +67,7 @@ def main():
         "gpu": torch.cuda.get_device_name(),
         "model": type(policy.model).__name__,
         "rtc": dataclasses.asdict(rtc),
+        "simple": dataclasses.asdict(simple),
         "config": identity(policy.artifacts.config_path),
         "checkpoint": identity(policy.artifacts.checkpoint_path),
         "normalization": identity(policy.artifacts.norm_stats_path),
@@ -83,7 +86,7 @@ def main():
         policy.action_infer_mode = mode
         policy._infer_fn = policy._resolve_infer_fn()
         previous = np.empty((0, 14), dtype=np.float32)
-        for method in ("none", "rtc"):
+        for method in ("none", "rtc", "simple"):
             context = {
                 "episode_id": f"smoke-{mode}",
                 "request_id": len(report["results"]),
@@ -108,7 +111,9 @@ def main():
                 for p in policy.model.parameters()
             )
             np.save(output.output_dir / f"{mode}-{method}.npy", actions)
-            previous = actions[policy.action_horizon // 2 :].copy()
+            if method == "none":
+                # Compare both guidance methods against the same physical prefix.
+                previous = actions[policy.action_horizon // 2 :].copy()
             report["results"].append(
                 {
                     "mode": mode,

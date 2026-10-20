@@ -107,6 +107,7 @@ def running_server(policy, legacy=False, wrong_id=False):
     if legacy:
         server._metadata.pop("supports_timed_chunks")
         server._metadata.pop("supports_rtc")
+        server._metadata.pop("supports_simple")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     port = server.wait_until_ready()
@@ -203,6 +204,8 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual(result.context["observation_step"], 0)
                 with self.assertRaises(RemotePolicyError):
                     client.require_guidance("rtc")
+                with self.assertRaises(RemotePolicyError):
+                    client.require_guidance("simple")
                 adapter.reset()
                 self.assertIsNone(adapter.poll())
             finally:
@@ -326,6 +329,45 @@ class ProtocolTests(unittest.TestCase):
             invalid[key] = value
             with self.assertRaises(ValueError, msg=key):
                 validate_chunk_context(invalid)
+
+    def test_simple_and_rtc_capabilities_are_independent(self):
+        class GuidedPolicy(Policy):
+            supports_chunk_context = True
+
+            def select_action(self, obs, history=None, *, chunk_context=None):
+                self.context = chunk_context
+                return super().select_action(obs, history)
+
+        for rtc, simple in ((False, False), (True, False), (False, True), (True, True)):
+            policy = GuidedPolicy()
+            policy.supports_rtc, policy.supports_simple = rtc, simple
+            with (
+                self.subTest(rtc=rtc, simple=simple),
+                running_server(policy) as port,
+                WebsocketClientPolicy(port=port) as client,
+            ):
+                self.assertEqual(client.supports_simple, simple)
+                self.assertEqual(client.supports_rtc, rtc)
+                for method, enabled in (("rtc", rtc), ("simple", simple)):
+                    request = context(step=7)
+                    request["guidance_method"] = method
+                    if not enabled:
+                        with self.assertRaises(RemotePolicyError):
+                            client.require_guidance(method)
+                        # Verify the server also rejects clients bypassing capability checks.
+                        with self.assertRaises(RemotePolicyError):
+                            client._request({
+                                "type": "select_action", "observation": observation(),
+                                "chunk_context": request,
+                            })
+                        continue
+                    action, _, _ = client.select_action(observation(), chunk_context=request)
+                    self.assertEqual(policy.context["guidance_method"], method)
+                    self.assertEqual(client.last_chunk_context["observation_step"], 7)
+                    self.assertEqual(action.shape, (20, 14))  # Full chunk, no server-side skip.
+                    np.testing.assert_array_equal(
+                        policy.context["previous_actions"], request["previous_actions"]
+                    )
 
     def test_cancellation_keeps_lock_until_inference_finishes(self):
         async def check():

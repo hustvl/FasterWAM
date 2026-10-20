@@ -1,0 +1,9 @@
+# Explicit opt-in; independent of RTC, training config and checkpoints.
+# CLI > this file (only when selected) > serving defaults.
+simple:
+  enabled: true
+  prefix_attention_schedule: exp
+action_infer_mode: one_pass_future_cache  # or joint_rollout
+num_inference_steps: 10
+seed: 42
+control_fps: null                       # dataset fps; client uses server control_dt

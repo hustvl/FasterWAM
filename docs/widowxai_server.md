@@ -102,12 +102,12 @@ It defaults to the two-wrist `step_000960.pt`. A legacy three-camera run can be
 tested with `RUN_DIR`, `CONFIG`, `CHECKPOINT`, and `NORM_STATS` environment
 overrides.
 
-## Asynchronous chunks and inference-only RTC
+## Asynchronous chunks and inference-only guidance
 
-RTC is disabled by default. No training config, training procedure, checkpoint,
+RTC and simple are disabled by default. No training config, training procedure, checkpoint,
 robot YAML, or ndarray serializer changes are needed. The physical boundary is
 absolute `[L,14]` joint targets. Both `one_pass_future_cache` and `joint_rollout`
-accept the same RTC context.
+support `none`, `rtc`, and `simple`.
 
 ```bash
 # Sync or unguided async clients: ordinary server, RTC disabled.
@@ -124,11 +124,25 @@ PYTHONPATH=src python scripts/serve_widowxai_policy.py \
   --run-dir /path/to/local/run --model-base-path /path/to/local/base-weights \
   --serving-config configs/serve/rtc.yaml --action-infer-mode joint_rollout \
   --rtc-prefix-schedule exp --rtc-max-guidance-weight 5.0
+
+# Gradient-free clean-action mixing, available in both paths.
+PYTHONPATH=src python scripts/serve_widowxai_policy.py \
+  --run-dir /path/to/local/run --model-base-path /path/to/local/base-weights \
+  --serving-config configs/serve/simple.yaml
+PYTHONPATH=src python scripts/serve_widowxai_policy.py \
+  --run-dir /path/to/local/run --model-base-path /path/to/local/base-weights \
+  --serving-config configs/serve/simple.yaml --action-infer-mode joint_rollout \
+  --simple-prefix-schedule exp
 ```
 
 `--config` remains the resolved training config. `--serving-config` is separate;
-CLI overrides its fields. With no serving file, RTC stays disabled and ordinary
+CLI overrides its fields. With no serving file, both methods stay disabled and ordinary
 inference defaults remain unchanged. `--rtc`/`--no-rtc` override enablement.
+`--simple`/`--no-simple` independently override simple enablement, and
+`--simple-prefix-schedule` overrides `simple.prefix_attention_schedule`.
+The server may enable both capabilities, e.g. `--rtc --simple`; each request
+selects exactly one method. Clients use `--mode async --guidance-method simple`
+to request simple. The first chunk still uses ordinary inference.
 The server publishes `control_dt`; clients use it without action resampling.
 No model downloads occur unless the existing `--allow-download` flag is given.
 
@@ -142,19 +156,21 @@ is unchanged; a client may add the following `chunk_context` mapping:
 | `control_dt` | Positive finite seconds per control step, matching server metadata |
 | `previous_actions` | Finite physical `[L,14]` unexecuted targets, rebased by the server |
 | `inference_delay_steps` | Nonnegative predicted delay; never interpreted as the actual response skip |
-| `guidance_method` | `none` or `rtc` |
+| `guidance_method` | `none`, `rtc`, or `simple` |
 
 Responses echo the three identifiers in `chunk_context` and return the entire
 chunk. Only the client skips elapsed *executed control steps*. Metadata advertises
-`supports_timed_chunks` and `supports_rtc`; the latter is true only when RTC is
-enabled and the selected model path accepts it. Untimed requests and legacy
+`supports_timed_chunks`, `supports_rtc`, and `supports_simple`; each guidance
+capability is true only when that method is enabled and the selected model path
+accepts it. Untimed requests and legacy
 policies retain their original call signature. Client-side single-flight
-correlation permits unguided async against old servers. RTC against an old or
-RTC-disabled server fails before robot initialization. Reset and inference share
+correlation permits unguided async against old servers. Requesting RTC/simple
+against a server without that capability fails before robot initialization.
+Reset and inference share
 the same lock, including while a repeatedly cancelled request's worker finishes. A response
 to a disconnected client is discarded, never carried into another connection.
 
-For every RTC request, physical previous targets pass through the training
+For every RTC/simple request, physical previous targets pass through the training
 `action_state_transform`, normalizer, and merger, using the *current observation*
 qpos. Existing transform settings decide relative joints and absolute grippers.
 Stepwise normalization is supported by padding before transformation and retaining
@@ -173,9 +189,35 @@ The cotangent is weighted once. The scheduler already supplies negative sigma
 deltas. Model parameters stay frozen, only action-input gradients are enabled,
 and each denoise step detaches its graph. Video flow is unchanged; the future
 cache is computed without gradients and reused. Disabling RTC preserves the
-original no-grad entry points. RTC arguments are never silently signature-filtered.
+original no-grad entry points. Guidance arguments are never silently signature-filtered.
 
-RTC conditions the planned targets, including known fixed-gripper constraints.
+The shared `wan22/simple.py` implements clean-action mixing without VJP or
+autograd. It reuses only RTC's prefix weights: `start = min(predicted_delay, L)`,
+`end = L`, zero outside the valid prefix. The default is `exp`; `linear`, `ones`,
+and `zeros` are also supported with the same semantics described above.
+Simple has no maximum guidance weight; the mask alone controls the mixture.
+In FasterWAM's decreasing-sigma convention (`tau = 1-sigma`, `v = -u`):
+
+```python
+x_pred = x - sigma * u
+x_target = weights * previous_actions + (1 - weights) * x_pred
+u_simple = (x - x_target) / sigma
+x_next = x + delta_sigma * u_simple
+```
+
+Both paths use the shared helper after their ordinary scheduler update. The
+implementation adds the equivalent correction
+`(-delta_sigma / sigma) * weights * (previous_actions - x_pred)` to that update,
+using float32 for the correction. This avoids constructing a large intermediate
+velocity at small sigma and respects nonuniform, shifted schedules. The mixed
+latent is the next denoise step's input. Terminal sigma zero is never evaluated.
+Disabled, empty, or zero-weight guidance preserves the ordinary update exactly,
+as do all positions outside the valid prefix. Model weights stay frozen; simple
+uses one normal prediction per step and no input gradients. Video and future-cache
+processing retain their existing paths. A model call cannot accept both
+`rtc_guidance` and `simple_guidance`.
+
+RTC and simple condition the planned targets, including known fixed-gripper constraints.
 The robot's observation-dependent safety filter still runs immediately before
 execution. Its changes are logged by the client; planned-prefix guidance does
 not guarantee the executed trajectory matches that prefix.
@@ -190,6 +232,7 @@ or pass `--client-scripts`; the dummy test no longer has a user-specific client 
 python -m unittest discover -s tests -p 'test_*.py' -v
 # FasterWAM repository:
 PYTHONPATH=src python scripts/test_rtc.py -v
+PYTHONPATH=src python scripts/test_simple.py -v
 PYTHONPATH=src python scripts/test_chunk_protocol.py -v \
   --client-scripts /path/to/sbr-wm-deploy/trossen_ai_aloha/scripts
 PYTHONPATH=src python scripts/test_widowxai_server_dummy.py \
@@ -202,10 +245,14 @@ cancellation while holding the policy lock, robot cleanup ordering with mocked
 drivers, old-server correlation, raw/JPEG and old sync API, prefix known values,
 analytic VJP/sign/time conversion, global/stepwise normalization round trips,
 frozen weights, and both production denoise loops with tiny analytic experts.
+Simple tests compare the conceptual tau/velocity loop with the sigma implementation
+for uniform and shifted schedules, verify next-step propagation, endpoint behavior,
+zero/empty masks, and absence of gradients. Protocol tests check independent
+RTC/simple capability combinations and reject unsupported methods.
 Numeric tests use seed 42, synthetic inputs/statistics, and no dataset/checkpoint.
 
 With a locally available GPU and artifacts, the following short smoke loads the
-model once and runs both paths, each with RTC off/on. It uses synthetic images,
+model once and runs both paths, each with `none`, `rtc`, and `simple`. It uses synthetic images,
 never a robot, and refuses downloads or an existing result directory:
 
 ```bash
@@ -217,6 +264,6 @@ PYTHONPATH=src python scripts/test_widowxai_rtc_smoke.py \
 ```
 
 The manifest records config/statistics SHA256, checkpoint path/size/mtime, model,
-seed, device, effective RTC settings, synthetic-data identity and timings.
+seed, device, effective RTC/simple settings, synthetic-data identity and timings.
 CPU verification does not establish real-checkpoint GPU memory/latency, real-robot
 performance improvements, or safe continuous operation. Validate those separately.

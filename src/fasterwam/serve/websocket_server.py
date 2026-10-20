@@ -38,6 +38,7 @@ def build_policy_metadata(policy: Any) -> dict[str, Any]:
         "supports_predicted_video": False,
         "supports_timed_chunks": True,
         "supports_rtc": bool(getattr(policy, "supports_rtc", False)),
+        "supports_simple": bool(getattr(policy, "supports_simple", False)),
     }
     attributes = (
         "control_dt",
@@ -78,8 +79,8 @@ def validate_chunk_context(context: Any) -> dict[str, Any]:
     dt = context["control_dt"]
     if isinstance(dt, bool) or not isinstance(dt, (int, float)) or not math.isfinite(dt) or dt <= 0:
         raise ValueError("control_dt must be finite and positive")
-    if context["guidance_method"] not in ("none", "rtc"):
-        raise ValueError("guidance_method must be none or rtc")
+    if context["guidance_method"] not in ("none", "rtc", "simple"):
+        raise ValueError("guidance_method must be none, rtc or simple")
     actions = np.asarray(context["previous_actions"], dtype=np.float32)
     if actions.ndim != 2 or actions.shape[1] != 14 or not np.isfinite(actions).all():
         raise ValueError("previous_actions must be finite [L,14] physical actions")
@@ -241,13 +242,14 @@ class WebsocketPolicyServer:
                 server_dt = self._metadata.get("control_dt")
                 if server_dt is not None and not math.isclose(context["control_dt"], server_dt, rel_tol=1e-6):
                     raise ValueError("control_dt differs from server; action resampling is unsupported")
-                if context["guidance_method"] == "rtc" and not self._metadata["supports_rtc"]:
-                    raise ValueError("RTC is not enabled/supported on this server")
+                method = context["guidance_method"]
+                if method != "none" and not self._metadata[f"supports_{method}"]:
+                    raise ValueError(f"{method} is not enabled/supported on this server")
                 # Legacy policies need no new keyword for time-based, unguided chunks.
                 if getattr(self._policy, "supports_chunk_context", False):
                     kwargs["chunk_context"] = context
-                elif context["guidance_method"] == "rtc":
-                    raise ValueError("Policy cannot receive RTC context")
+                elif method != "none":
+                    raise ValueError(f"Policy cannot receive {method} context")
             assert self._infer_lock is not None
             async with self._infer_lock:
                 start = time.perf_counter()

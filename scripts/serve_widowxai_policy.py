@@ -11,6 +11,7 @@ from pathlib import Path
 import yaml
 
 from fasterwam.models.wan22.rtc import RTCConfig
+from fasterwam.models.wan22.simple import SimpleConfig
 from fasterwam.serve import WebsocketPolicyServer, WidowXAIFasterWAMPolicy
 from fasterwam.serve.widowxai_policy import (
     ACTION_INFER_MODES,
@@ -47,13 +48,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rtc", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--rtc-prefix-schedule", choices=["exp", "linear", "ones", "zeros"], default=None)
     parser.add_argument("--rtc-max-guidance-weight", type=float, default=None)
+    parser.add_argument("--simple", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--simple-prefix-schedule", choices=["exp", "linear", "ones", "zeros"], default=None)
     args = parser.parse_args()
     settings = {}
     if args.serving_config is not None:
         with args.serving_config.open(encoding="utf-8") as stream:
             settings = yaml.safe_load(stream) or {}
         if not isinstance(settings, dict) or set(settings) - {
-            "rtc", "action_infer_mode", "num_inference_steps", "seed", "control_fps"
+            "rtc", "simple", "action_infer_mode", "num_inference_steps", "seed", "control_fps"
         }:
             parser.error("Unknown serving configuration fields")
     rtc = settings.get("rtc", {})
@@ -64,6 +67,13 @@ def parse_args() -> argparse.Namespace:
         prefix_attention_schedule=args.rtc_prefix_schedule or rtc.get("prefix_attention_schedule", "exp"),
         max_guidance_weight=(args.rtc_max_guidance_weight if args.rtc_max_guidance_weight is not None
                              else rtc.get("max_guidance_weight", 5.0)),
+    )
+    simple = settings.get("simple", {})
+    if not isinstance(simple, dict) or set(simple) - {"enabled", "prefix_attention_schedule"}:
+        parser.error("Unknown simple configuration fields")
+    args.simple_config = SimpleConfig(
+        enabled=args.simple if args.simple is not None else simple.get("enabled", False),
+        prefix_attention_schedule=args.simple_prefix_schedule or simple.get("prefix_attention_schedule", "exp"),
     )
     for key in ("action_infer_mode", "num_inference_steps", "seed", "control_fps"):
         if getattr(args, key) is None:
@@ -83,7 +93,10 @@ def main() -> None:
         checkpoint_path=args.checkpoint,
         norm_stats_path=args.norm_stats,
     )
-    print(f"[serve-widowxai] rtc={args.rtc_config} seed={args.seed}", flush=True)
+    print(
+        f"[serve-widowxai] rtc={args.rtc_config} simple={args.simple_config} seed={args.seed}",
+        flush=True,
+    )
     hostname = socket.gethostname()
     print(f"[serve-widowxai] node={hostname}", flush=True)
     print(f"[serve-widowxai] run_dir={artifacts.run_dir}", flush=True)
@@ -108,6 +121,7 @@ def main() -> None:
         seed=args.seed,
         control_fps=args.control_fps,
         rtc_config=args.rtc_config,
+        simple_config=args.simple_config,
     )
     print(
         "[serve-widowxai] visual_input="
