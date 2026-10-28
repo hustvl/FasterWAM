@@ -658,6 +658,28 @@ class FastWAM(torch.nn.Module):
         fuse_vae_embedding_in_latents: bool,
         gt_action: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._predict_joint_noise_differentiable(
+            latents_video=latents_video,
+            latents_action=latents_action,
+            timestep_video=timestep_video,
+            timestep_action=timestep_action,
+            context=context,
+            context_mask=context_mask,
+            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+            gt_action=gt_action,
+        )
+
+    def _predict_joint_noise_differentiable(
+        self,
+        latents_video: torch.Tensor,
+        latents_action: torch.Tensor,
+        timestep_video: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        fuse_vae_embedding_in_latents: bool,
+        gt_action: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         video_pre = self.video_expert.pre_dit(
             x=latents_video,
             timestep=timestep_video,
@@ -779,6 +801,26 @@ class FastWAM(torch.nn.Module):
         context_mask: torch.Tensor,
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: Union[torch.Tensor, Sequence[torch.Tensor]],
+        video_seq_len: int,
+    ) -> torch.Tensor:
+        return self._predict_action_noise_with_cache_differentiable(
+            latents_action=latents_action,
+            timestep_action=timestep_action,
+            context=context,
+            context_mask=context_mask,
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
+
+    def _predict_action_noise_with_cache_differentiable(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor | Sequence[torch.Tensor],
         video_seq_len: int,
     ) -> torch.Tensor:
         action_pre = self.action_expert.pre_dit(

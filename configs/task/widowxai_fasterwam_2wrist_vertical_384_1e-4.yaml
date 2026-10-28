@@ -1,0 +1,38 @@
+# @package _global_
+
+defaults:
+  - override /data: widowxai_2wrist_vertical
+  - override /model: fasterwam
+  - _self_
+
+batch_size: 32
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: true
+  redirect_common_files: false
+  action_dit_pretrained_path: null
+  loss:
+    lambda_video: 1.0
+    lambda_action: 1.0
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 28
+max_steps: 1600
+log_every: 10
+save_every: 160
+eval_every: 0
+eval_num_inference_steps: 10
+
+wandb:
+  enabled: true
+  project: fasterwam
+
+gradient_accumulation_steps: 4
+weight_decay: 1e-2
+max_grad_norm: 1.0
+keep_last_n_states: 1
+resume: null
+
+default_action_infer_mode: one_pass_future_cache

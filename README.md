@@ -297,6 +297,14 @@ NUM_GPUS=8 \
 bash scripts/eval_fasterwam_robotwin.sh
 ```
 
+### WidowXAI real-robot server
+
+WidowXAI checkpoints can be exposed to the existing Trossen remote policy
+client with the binary WebSocket/MessagePack server. It supports both the
+top-view-free two-wrist config and legacy three-camera configs without a
+`drop_top_view` key. See [`docs/widowxai_server.md`](docs/widowxai_server.md)
+for preprocessing, inference, Slurm, and communication-test details.
+
 ## Acknowledgments
 
 Our codebase is built upon:

@@ -148,11 +148,17 @@ def _load_model_config(path: Path) -> tuple[dict[str, Any], dict[str, Any], Any]
         raise ValueError("`video_dit_config` and `action_dit_config` must resolve to dicts.")
 
     if _is_unresolved_interpolation(video_cfg.get("action_dim")):
-        print("[WARN] `video_dit_config.action_dim` is unresolved; defaulting to 7 for preprocessing.")
+        print(
+            "[WARN] `video_dit_config.action_dim` is unresolved; defaulting to 7 for preprocessing. "
+            "The video expert is not action-conditioned, so this does not affect copied backbone weights."
+        )
         video_cfg["action_dim"] = 7
 
     if _is_unresolved_interpolation(action_cfg.get("action_dim")):
-        print("[WARN] `action_dit_config.action_dim` is unresolved; defaulting to 7 for preprocessing.")
+        print(
+            "[WARN] `action_dit_config.action_dim` is unresolved; defaulting to 7 for preprocessing. "
+            "Action-dimension-dependent action_encoder/head weights are intentionally excluded from the payload."
+        )
         action_cfg["action_dim"] = 7
 
     for key in ["num_heads", "attn_head_dim", "text_dim", "freq_dim"]:
@@ -193,6 +199,14 @@ def main() -> None:
         default="true",
         help="Whether to apply alpha=sqrt(dv/da) when the last dimension is resized (true/false). Default: true.",
     )
+    parser.add_argument(
+        "--redirect-common-files",
+        default=None,
+        help=(
+            "Override `redirect_common_files` from the model config (true/false). "
+            "Pass false when using the original Wan-AI .pth files from Hugging Face."
+        ),
+    )
     args = parser.parse_args()
 
     model_config_path = Path(args.model_config)
@@ -210,7 +224,10 @@ def main() -> None:
         args.condition_layers if args.condition_layers is not None else cfg_condition_layers
     )
     torch_dtype = _parse_dtype(args.dtype)
-    redirect_common_files = _parse_bool(cfg.get("redirect_common_files", False))
+    if args.redirect_common_files is None:
+        redirect_common_files = _parse_bool(cfg.get("redirect_common_files", False))
+    else:
+        redirect_common_files = _parse_bool(args.redirect_common_files)
 
     int_fields = [
         "hidden_dim",
@@ -240,6 +257,9 @@ def main() -> None:
         tokenizer_model_id=cfg.get("tokenizer_model_id", "Wan-AI/Wan2.1-T2V-1.3B"),
         redirect_common_files=redirect_common_files,
         dit_config=video_cfg,
+        # Only the video DiT supplies initialization weights. Avoid loading the
+        # 11 GB text encoder during this one-time preprocessing step.
+        load_text_encoder=False,
     )
     video_expert = components.dit
     video_num_layers = int(len(video_expert.blocks))

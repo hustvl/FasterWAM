@@ -41,8 +41,29 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
+        drop_top_view: bool = False,
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
     ):
+        self.drop_top_view = bool(drop_top_view)
+        if self.drop_top_view:
+            image_keys = [str(meta["key"]) for meta in shape_meta["images"]]
+            expected_image_keys = ["cam_left_wrist", "cam_right_wrist"]
+            if image_keys != expected_image_keys:
+                raise ValueError(
+                    "`drop_top_view=true` requires exactly the two wrist cameras in "
+                    f"left/right order: {expected_image_keys}, got {image_keys}."
+                )
+            if concat_multi_camera != "vertical":
+                raise ValueError(
+                    "`drop_top_view=true` requires `concat_multi_camera='vertical'`, "
+                    f"got {concat_multi_camera!r}."
+                )
+            if int(video_size[0]) % 2 != 0:
+                raise ValueError(
+                    "`drop_top_view=true` requires an even output height for equal wrist panels, "
+                    f"got video_size={video_size}."
+                )
+
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
@@ -151,7 +172,50 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         image_is_pad = image_is_pad[self.video_sample_indices]
 
         video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
-        if self.concat_multi_camera == "robotwin":
+        if self.drop_top_view:
+            if num_cameras != 2:
+                raise ValueError(
+                    f"`drop_top_view=true` requires exactly 2 wrist cameras, got {num_cameras}."
+                )
+
+            # Preserve each wrist camera's full field of view and aspect ratio.
+            # Each camera is fit into half of the final frame and padded with
+            # neutral gray (0.5 before the final [-1, 1] normalization).
+            target_h, target_w = (int(self.video_size[0]), int(self.video_size[1]))
+            panel_h = target_h // 2
+            panel_w = target_w
+            wrist_panels = []
+            for camera_idx in range(2):
+                camera = video[camera_idx]
+                source_h, source_w = camera.shape[-2:]
+                scale = min(panel_h / source_h, panel_w / source_w)
+                resized_h = min(panel_h, max(1, int(round(source_h * scale))))
+                resized_w = min(panel_w, max(1, int(round(source_w * scale))))
+                camera = transforms_F.resize(
+                    camera,
+                    size=[resized_h, resized_w],
+                    interpolation=transforms_F.InterpolationMode.BILINEAR,
+                    antialias=True,
+                )
+                pad_h = panel_h - resized_h
+                pad_w = panel_w - resized_w
+                pad_left = pad_w // 2
+                pad_right = pad_w - pad_left
+                pad_top = pad_h // 2
+                pad_bottom = pad_h - pad_top
+                camera = transforms_F.pad(
+                    camera,
+                    padding=[pad_left, pad_top, pad_right, pad_bottom],
+                    fill=0.5,
+                )
+                if tuple(camera.shape[-2:]) != (panel_h, panel_w):
+                    raise RuntimeError(
+                        "Wrist panel has unexpected shape after resize/pad: "
+                        f"expected={(panel_h, panel_w)}, got={tuple(camera.shape[-2:])}."
+                    )
+                wrist_panels.append(camera)
+            video = torch.cat(wrist_panels, dim=-2)
+        elif self.concat_multi_camera == "robotwin":
             if num_cameras != 3:
                 raise ValueError(
                     f"`concat_multi_camera='robotwin'` requires exactly 3 cameras, got {num_cameras}"

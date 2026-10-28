@@ -1,0 +1,45 @@
+# @package _global_
+
+# FasterWAM on the 98-episode WidowXAI success-only dataset. The data,
+# optimization, batch topology, and training exposure match the FastWAM run;
+# only FasterWAM's sparse action architecture and equal 1:1 loss weighting
+# differ by design.
+
+defaults:
+  - override /data: widowxai_3cam
+  - override /model: fasterwam
+  - _self_
+
+# 32 samples/GPU x 8 GPUs x 4 accumulation = global batch 1024.
+batch_size: 32
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: true
+  redirect_common_files: false
+  action_dit_pretrained_path: /groups/gcg51472/acf16376hu/fasterwam/checkpoints/SparseActionDiT_cond_0_4_8_12_16_20_24_28_Wan22_alphascale_1024hdim_widowxai.pt
+  loss:
+    lambda_video: 1.0
+    lambda_action: 1.0
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 28 # documented exposure; max_steps controls the run
+# 1600 x 1024 = 1.638M samples = 27.96 passes over 58,600 frames.
+max_steps: 1600
+log_every: 10
+save_every: 160
+eval_every: 100
+eval_num_inference_steps: 10
+
+wandb:
+  enabled: true
+  project: fasterwam
+
+gradient_accumulation_steps: 4
+weight_decay: 1e-2
+max_grad_norm: 1.0
+keep_last_n_states: 2
+resume: null
+
+default_action_infer_mode: one_pass_future_cache

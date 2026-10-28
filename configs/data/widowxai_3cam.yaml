@@ -1,0 +1,102 @@
+# WidowXAI bimanual demonstrations (LeRobot v2.0, 3 cameras, 14-DoF).
+#
+# state/action layout:
+#   [0:6]   left joints       -> relative to state at observation frame 0
+#   [6]     left gripper      -> absolute
+#   [7:13]  right joints      -> relative to state at observation frame 0
+#   [13]    right gripper     -> absolute
+#
+# The source action is an absolute joint target. Only joint dimensions are
+# rebased; gripper commands remain absolute. Do not combine this transform
+# with delta_action_dim_mask because padded absolute targets must be replicated
+# before rebasing.
+
+_shape_meta: &shape_meta
+  images:
+    - key: cam_high
+      raw_shape: [3, 480, 640]
+      shape: [3, 240, 320]
+    - key: cam_left_wrist
+      raw_shape: [3, 480, 640]
+      shape: [3, 240, 320]
+    - key: cam_right_wrist
+      raw_shape: [3, 480, 640]
+      shape: [3, 240, 320]
+  action:
+    - key: default
+      raw_shape: 14
+      shape: 14
+  state:
+    - key: default
+      raw_shape: 14
+      shape: 14
+
+_relative_joint_mask: &relative_joint_mask
+  default:
+    [true, true, true, true, true, true, false,
+     true, true, true, true, true, true, false]
+
+_processor: &processor
+  _target_: fasterwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+  shape_meta: ${data.train.shape_meta}
+  num_obs_steps: ${data.train.num_frames}
+  num_output_cameras: 3
+  action_output_dim: 14
+  proprio_output_dim: 14
+
+  action_state_transforms:
+    - _target_: fasterwam.datasets.lerobot.transforms.relative_action.MaskedRelativeJointTransform
+      dim_masks: *relative_joint_mask
+  use_stepwise_action_norm: false
+  norm_default_mode: "z-score"
+  norm_exception_mode: null
+
+  action_state_merger:
+    _target_: fasterwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+
+  train_transforms:
+    - _target_: fasterwam.datasets.lerobot.transforms.image.ToTensor
+    - _target_: torchvision.transforms.Resize
+      size: [240, 320]
+  val_transforms:
+    - _target_: fasterwam.datasets.lerobot.transforms.image.ToTensor
+    - _target_: torchvision.transforms.Resize
+      size: [240, 320]
+
+train:
+  _target_: fasterwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  dataset_dirs:
+    - /home/acf16376hu/data/real_widowxai_success_only
+  shape_meta: *shape_meta
+  num_frames: 33
+  global_sample_stride: 1
+  action_video_freq_ratio: 4
+  video_size: [384, 320]
+  camera_key: null
+  val_set_proportion: 0.0
+  is_training_set: true
+  pretrained_norm_stats: null
+  skip_padding_as_possible: false
+  concat_multi_camera: "robotwin"
+  processor: *processor
+  text_embedding_cache_dir: /groups/gcg51472/acf16376hu/fasterwam/text_embeds_cache/widowxai
+  context_len: 128
+
+val:
+  _target_: fasterwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  dataset_dirs:
+    - /home/acf16376hu/data/real_widowxai_test
+  shape_meta: *shape_meta
+  num_frames: 33
+  global_sample_stride: 1
+  action_video_freq_ratio: 4
+  video_size: [384, 320]
+  camera_key: null
+  val_set_proportion: 0.0
+  is_training_set: false
+  pretrained_norm_stats: null
+  skip_padding_as_possible: false
+  concat_multi_camera: "robotwin"
+  processor: *processor
+  text_embedding_cache_dir: /groups/gcg51472/acf16376hu/fasterwam/text_embeds_cache/widowxai
+  context_len: 128

@@ -1148,7 +1148,14 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         # TODO(rcadene, aliberts): We should not perform this aggregation for datasets
         # with multiple robots of different ranges. Instead we should have one normalization
         # per robot.
-        self.stats = aggregate_stats([dataset.meta.stats for dataset in self._datasets])
+        # WidowXAI is a LeRobot v2.0 derivative whose global stats predate the
+        # per-feature ``count`` field expected by aggregate_stats(). For one
+        # dataset no aggregation is needed, and policy normalization is
+        # computed from post-transform samples by RobotVideoDataset anyway.
+        if len(self._datasets) == 1:
+            self.stats = self._datasets[0].meta.stats
+        else:
+            self.stats = aggregate_stats([dataset.meta.stats for dataset in self._datasets])
 
     def set_during_training(self, during_training: bool):
         for dataset in self._datasets:
@@ -1254,8 +1261,10 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                             message="The given NumPy array is not writable",
                             category=UserWarning,
                         )
-                        # deal with string in parquet file
-                        if np_arr.dtype == 'O':                        
+                        # Arrow strings can surface as object, Unicode, or
+                        # byte-string arrays; torch.from_numpy only accepts
+                        # numeric and boolean dtypes.
+                        if np_arr.dtype.kind in {"O", "U", "S"}:
                             result_dict[col_name] = np_arr
                         else:
                             result_dict[col_name] = torch.from_numpy(np_arr)

@@ -292,6 +292,7 @@ dependencies = [
     { name = "imageio-ffmpeg" },
     { name = "jsonlines" },
     { name = "modelscope" },
+    { name = "msgpack" },
     { name = "numpy" },
     { name = "omegaconf" },
     { name = "packaging" },
@@ -310,6 +311,7 @@ dependencies = [
     { name = "transformers" },
     { name = "typing-extensions" },
     { name = "wandb" },
+    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -329,6 +331,7 @@ requires-dist = [
     { name = "imageio-ffmpeg", specifier = "==0.6.0" },
     { name = "jsonlines", specifier = "==4.0.0" },
     { name = "modelscope", specifier = "==1.34.0" },
+    { name = "msgpack", specifier = ">=1.1,<2" },
     { name = "numpy", specifier = "==1.26.4" },
     { name = "omegaconf", specifier = "==2.3.0" },
     { name = "packaging", specifier = "==25.0" },
@@ -347,6 +350,7 @@ requires-dist = [
     { name = "transformers", specifier = "==4.49.0" },
     { name = "typing-extensions", specifier = "==4.15.0" },
     { name = "wandb", specifier = "==0.23.1" },
+    { name = "websockets", specifier = ">=14,<16" },
 ]
 
 [[package]]
@@ -1440,6 +1444,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c0/6d/e78093d49d68afb26f5261a70fc7877c34c114af5c2ee0ab3b1af85f5e76/wandb-0.23.1-py3-none-win32.whl", hash = "sha256:fb5cf0f85692f758a5c36ab65fea96a1284126de64e836610f92ddbb26df5ded" },
     { url = "https://files.pythonhosted.org/packages/05/27/4f13454b44c9eceaac3d6e4e4efa2230b6712d613ff9bf7df010eef4fd18/wandb-0.23.1-py3-none-win_amd64.whl", hash = "sha256:21c8c56e436eb707b7d54f705652e030d48e5cfcba24cf953823eb652e30e714" },
     { url = "https://files.pythonhosted.org/packages/30/20/6c091d451e2a07689bfbfaeb7592d488011420e721de170884fedd68c644/wandb-0.23.1-py3-none-win_arm64.whl", hash = "sha256:8aee7f3bb573f2c0acf860f497ca9c684f9b35f2ca51011ba65af3d4592b77c1" },
+]
+
+[[package]]
+name = "websockets"
+version = "15.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/21/e6/26d09fab466b7ca9c7737474c52be4f76a40301b08362eb2dbc19dcc16c1/websockets-15.0.1.tar.gz", hash = "sha256:82544de02076bafba038ce055ee6412d68da13ab47f0c60cab827346de828dee", size = 177016, upload-time = "2025-03-05T20:03:41.606Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fa/a8/5b41e0da817d64113292ab1f8247140aac61cbf6cfd085d6a0fa77f4984f/websockets-15.0.1-py3-none-any.whl", hash = "sha256:f7a866fbc1e97b5c617ee4116daaa09b722101d4a3c170c787450ba409f9736f", size = 169743, upload-time = "2025-03-05T20:03:39.41Z" },
 ]
 
 [[package]]
