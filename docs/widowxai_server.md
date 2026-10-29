@@ -32,10 +32,17 @@ For `drop_top_view=true`, the server reproduces the two-wrist transform exactly:
 4. Normalize the resulting `384x320` mosaic to `[-1,1]`.
 5. Normalize `qpos` with the run's dataset statistics.
 
-For a missing/false flag, it reproduces the legacy `robotwin` composition:
+For a missing/false flag, `concat_multi_camera` selects the three-camera layout.
+The legacy `robotwin` composition is:
 `cam_high` becomes the `256x320` top panel, both wrists become `128x160`, and
 the wrists are concatenated horizontally below it. The result is also
 `384x320`, so the model architecture and FasterWAM inference path are shared.
+
+`left_high_right_horizontal` directly resizes each complete frame to one third
+of the configured output width, then concatenates **left wrist, high, right
+wrist**. For the 3-camera ratio-2 run below, each panel is `192x256`, producing
+`192x768` RGB normalized to `[-1,1]`. Input/shape-meta camera order remains
+`cam_high, cam_left_wrist, cam_right_wrist`.
 
 FasterWAM defaults to `one_pass_future_cache`: the current image is encoded,
 future-video KV features are prefetched once, and the 32-step normalized action
@@ -47,18 +54,109 @@ Check the online transform against a real offline sample without loading the
 5B checkpoint:
 
 ```bash
-PYTHONPATH=$PWD/src bash ../FastWAM/scripts/pixi_run.sh \
+bash scripts/pixi_run.sh \
   python scripts/validate_widowxai_online_preprocessing.py
 ```
 
 ## Start with Slurm
 
 ```bash
-cd /home/user128004/gitrepo/FasterWAM
+cd /home/user128004/gitrepo/FasterWAM-rtc
 sbatch \
   --export=ALL,CHECKPOINT=/lustre/data/fasterwam/runs/widowxai_fasterwam_2wrist_vertical_384_1e-4/widowxai_2wrist_vertical_scratch_4443674/checkpoints/weights/step_000960.pt \
   scripts/slurm/serve_widowxai_policy.sbatch
 ```
+
+The launcher defaults `REPO_ROOT` to the Slurm submission directory. Submit from
+this repository, or set `REPO_ROOT` explicitly. `scripts/pixi_run.sh` reuses the
+installed training Pixi environment without solving or installing packages;
+`FASTERWAM_PIXI_ENV` can override its environment directory.
+
+For the left/high/right ratio-2 checkpoint:
+
+```bash
+cd /home/user128004/gitrepo/FasterWAM-rtc
+export RUN_DIR=/lustre/data/fasterwam/runs/widowxai_fasterwam_3cam_384_1e-4/widowxai_3cam_vtoa_pick_cap_policy_random_policy_deploy_failed_success_stats_left_high_right_horizontal_action_video_freq_ratio2_4528728
+export CHECKPOINT="$RUN_DIR/checkpoints/weights/step_001600.pt"
+export TASK="pick up the brown cap and put it in the light blue bucket"
+sbatch --export=ALL scripts/slurm/serve_widowxai_policy.sbatch
+```
+
+The task must be explicit because this dataset contains three tasks. Its cached
+embedding is loaded from `data.val.text_embedding_cache_dir`; no text encoder is
+loaded. The run's `dataset_stats.json` supplies both state and action statistics.
+The saved ratio of 2 produces **32 action targets and 17 video frames**; physical
+control stays at **30 Hz**. Normal serving uses 10 denoising steps and
+`one_pass_future_cache`. `SERVING_CONFIG=configs/serve/rtc.yaml` or
+`configs/serve/simple.yaml` optionally enables asynchronous guidance.
+
+The inference config adapter accepts newer training-only options for this
+V-to-A run while rejecting bidirectional attention, active A2V layers, and random
+future blocks. Existing checkpoint weights are loaded directly.
+
+To compare the training repository and this repository with real servers on one
+Slurm GPU:
+
+```bash
+sbatch scripts/slurm/compare_widowxai_servers.sbatch
+```
+
+This starts both servers for each of `one_pass_future_cache` and `joint_rollout`,
+using `step_001600.pt`, seed 42, and 10 denoising steps. It requires exact
+elementwise equality for three reproducible synthetic observations plus a repeat
+after reset. It also compares CPU images, proprioception, language embeddings,
+and action denormalization. Logs, input arrays, action arrays and `results.json`
+are saved under `/lustre/data/fasterwam/validations/rtc_server_parity/job_JOBID`.
+The servers stop on completion or failure. `REFERENCE_REPO`, `RUN_DIR`,
+`CHECKPOINT`, `TASK`, and `RESULT_DIR` may be overridden through Slurm exports.
+
+Validated on 2026-10-22, Slurm job `4924588`, NVIDIA H100 80GB, using the existing
+Pixi environment. Both modes passed all four requests: physical `[32,14]` action
+chunks were exactly equal, with maximum absolute difference `0.0`. CPU image,
+proprioception, language context/mask, and inverse-action arrays also matched
+exactly. Results and logs are in
+`/lustre/data/fasterwam/validations/rtc_server_parity/job_4924588/results.json`.
+
+To repeat the comparison with RTC enabled on the candidate server:
+
+```bash
+sbatch --export=ALL,CANDIDATE_SERVING_CONFIG=configs/serve/rtc.yaml,EXERCISE_RTC=1 \
+  scripts/slurm/compare_widowxai_servers.sbatch
+```
+
+The test requires `supports_rtc=true` in the candidate metadata. Ordinary
+synchronous requests must still match the reference exactly. It then sends
+`guidance_method=rtc` requests synchronously (one request followed by waiting
+for its response), with `inference_delay_steps=0`. An empty prefix must preserve
+the ordinary result. A nonempty 16-step tail from the previous chunk exercises
+RTC guidance against a changed current observation; the output must be finite
+and differ from the ordinary result. Repeat-request numerical differences are
+reported separately in `repeat_comparison`; ordinary sync and empty-prefix
+comparisons still require exact equality, without a tolerance.
+These guided outputs are saved as `rtc_*.npy` and reported in `rtc_requests`.
+The reference repository does not implement RTC guidance, so nonempty-prefix
+outputs are compared for the effect and reproducibility of guidance rather
+than requiring equality to its ordinary prediction. No asynchronous executor
+is used in this test.
+
+RTC-enabled server validation on 2026-10-22 passed in Slurm job `4924687`:
+both modes advertised `supports_rtc=true`, all eight ordinary synchronous
+requests matched the reference exactly, and both empty-prefix RTC requests
+matched their ordinary outputs exactly (maximum difference `0.0`). Nonempty
+RTC requests returned finite `[32,14]` targets and changed the predictions.
+The report is
+`/lustre/data/fasterwam/validations/rtc_server_parity/job_4924687/results.json`.
+
+With the default GPU backend, identical nonempty RTC requests had repeat
+differences of `0.0022865534` (future cache) and `0.0034939498` (joint rollout).
+A separate SDPA test reproduced nondeterministic attention backward, while
+forward remained exact. A controlled real-model test with
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` and
+`torch.use_deterministic_algorithms(True)` gave exact RTC repeat equality for
+both modes. This diagnostic does not change the server's production defaults.
+Diagnostic scripts and results are under
+`/lustre/data/fasterwam/validations/rtc_attention_diagnostic/`, including
+`real_model_4924691/results.json`.
 
 After model loading, create an SSH tunnel from the robot PC:
 
@@ -231,6 +329,7 @@ or pass `--client-scripts`; the dummy test no longer has a user-specific client 
 # Client repository, from trossen_ai_aloha/:
 python -m unittest discover -s tests -p 'test_*.py' -v
 # FasterWAM repository:
+PYTHONPATH=src python scripts/test_widowxai_config.py -v
 PYTHONPATH=src python scripts/test_rtc.py -v
 PYTHONPATH=src python scripts/test_simple.py -v
 PYTHONPATH=src python scripts/test_chunk_protocol.py -v \

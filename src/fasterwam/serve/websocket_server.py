@@ -54,6 +54,7 @@ def build_policy_metadata(policy: Any) -> dict[str, Any]:
         "num_inference_steps",
         "action_infer_mode",
         "drop_top_view",
+        "concat_multi_camera",
         "checkpoint_path",
     )
     for name in attributes:

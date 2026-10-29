@@ -125,7 +125,7 @@ def main() -> None:
     )
     print(
         "[serve-widowxai] visual_input="
-        + ("2wrist_vertical" if policy.drop_top_view else "3camera_robotwin")
+        + ("2wrist_vertical" if policy.drop_top_view else f"3camera_{policy.concat_multi_camera}")
         + f" drop_top_view={str(policy.drop_top_view).lower()}",
         flush=True,
     )

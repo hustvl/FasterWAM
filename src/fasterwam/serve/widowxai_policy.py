@@ -96,6 +96,24 @@ def build_inference_model_config(cfg: DictConfig) -> DictConfig:
     """Return a checkpoint-only, inference-safe copy of the resolved model config."""
 
     model_cfg = OmegaConf.create(OmegaConf.to_container(cfg.model, resolve=True))
+    # Newer training runs carry options absent from this inference runtime.
+    # Only the original V-to-A architecture is supported here; never silently
+    # discard an option which would change its attention or sampling behavior.
+    if model_cfg.get("mot_interaction_mode", "v_to_a") != "v_to_a":
+        raise ValueError("This server supports only mot_interaction_mode='v_to_a'")
+    if model_cfg.get("action_to_video_layers"):
+        raise ValueError("This server does not support Action-to-Video layers")
+    if model_cfg.get("random_future_num_blocks") is not None:
+        raise ValueError("This server does not support random_future_num_blocks")
+    for key in (
+        "mot_interaction_mode", "action_to_video_layers", "a2v_temporal_mask_mode",
+        "a2v_gate_bias_init", "action_loss_excluded_task_ids",
+        "action_loss_excluded_task_names", "random_future_num_blocks",
+        "vae_encode_microbatch_size",
+    ):
+        # A2V options are inactive above. Loss exclusions and VAE training
+        # microbatching do not affect single-observation inference.
+        model_cfg.pop(key, None)
     model_cfg.skip_dit_load_from_pretrain = True
     model_cfg.action_dit_pretrained_path = None
     model_cfg.mot_checkpoint_mixed_attn = False
@@ -105,7 +123,7 @@ def build_inference_model_config(cfg: DictConfig) -> DictConfig:
 
 
 class WidowXAIOnlinePreprocessor:
-    """Reproduce a two-wrist or legacy three-camera run for one observation."""
+    """Reproduce the trained camera layout and transforms for one observation."""
 
     def __init__(self, cfg: DictConfig, norm_stats_path: str | Path) -> None:
         self.cfg = cfg
@@ -134,11 +152,14 @@ class WidowXAIOnlinePreprocessor:
                 f"drop_top_view={self.drop_top_view} requires the trained camera order "
                 f"{expected_cameras}, got {self.camera_names}"
             )
-        expected_concat = "vertical" if self.drop_top_view else "robotwin"
-        if str(self.data_cfg.concat_multi_camera) != expected_concat:
+        self.concat_multi_camera = str(self.data_cfg.concat_multi_camera)
+        expected_concats = ("vertical",) if self.drop_top_view else (
+            "robotwin", "left_high_right_horizontal",
+        )
+        if self.concat_multi_camera not in expected_concats:
             raise ValueError(
                 f"drop_top_view={self.drop_top_view} requires "
-                f"concat_multi_camera={expected_concat!r}, got "
+                f"concat_multi_camera in {expected_concats}, got "
                 f"{self.data_cfg.concat_multi_camera!r}"
             )
         action_meta = list(shape_meta["action"])
@@ -153,6 +174,12 @@ class WidowXAIOnlinePreprocessor:
         ratio = int(self.data_cfg.action_video_freq_ratio)
         self.num_video_frames = len(range(0, int(self.data_cfg.num_frames), ratio))
         self.video_size = tuple(int(v) for v in self.data_cfg.video_size)
+        if self.concat_multi_camera == "left_high_right_horizontal" and (
+            self.video_size[0] <= 0 or self.video_size[1] <= 0 or self.video_size[1] % 3
+        ):
+            raise ValueError(
+                "left_high_right_horizontal requires positive [H,W] with W divisible by 3"
+            )
         if self.drop_top_view and self.video_size[0] % 2:
             raise ValueError(f"drop_top_view requires an even model height, got {self.video_size}")
         self.raw_image_shape = tuple(int(v) for v in self.camera_meta[0]["raw_shape"][1:]) + (3,)
@@ -233,6 +260,19 @@ class WidowXAIOnlinePreprocessor:
         if self.drop_top_view:
             panels = [self._fit_wrist_panel(camera) for camera in cameras]
             mosaic = torch.cat(panels, dim=-2)
+        elif self.concat_multi_camera == "left_high_right_horizontal":
+            # shape_meta order is [high, left, right]; the trained mosaic is
+            # [left, high, right]. Keep each complete frame, without cropping.
+            panels = [
+                transforms_f.resize(
+                    cameras[index],
+                    size=[self.video_size[0], self.video_size[1] // 3],
+                    interpolation=transforms_f.InterpolationMode.BILINEAR,
+                    antialias=True,
+                )
+                for index in (1, 0, 2)
+            ]
+            mosaic = torch.cat(panels, dim=-1)
         else:
             cam_high = transforms_f.resize(
                 cameras[0],
@@ -379,6 +419,7 @@ class WidowXAIFasterWAMPolicy:
         self.preprocessor = WidowXAIOnlinePreprocessor(self.cfg, self.artifacts.norm_stats_path)
         self.camera_names = self.preprocessor.camera_names
         self.drop_top_view = self.preprocessor.drop_top_view
+        self.concat_multi_camera = self.preprocessor.concat_multi_camera
         self.raw_image_shape = self.preprocessor.raw_image_shape
         self.model_image_shape = self.preprocessor.model_image_shape
         self.action_horizon = self.preprocessor.action_horizon

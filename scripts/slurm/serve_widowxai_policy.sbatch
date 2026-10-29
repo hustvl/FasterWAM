@@ -12,8 +12,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:-/home/user128004/gitrepo/FasterWAM}"
-FASTWAM_REPO="${FASTWAM_REPO:-/home/user128004/gitrepo/FastWAM}"
+REPO_ROOT="${REPO_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 MODEL_ROOT="${MODEL_ROOT:-/lustre/data/fastwam_nakamura/checkpoints}"
 RUN_DIR="${RUN_DIR:-/lustre/data/fasterwam/runs/widowxai_fasterwam_2wrist_vertical_384_1e-4/widowxai_2wrist_vertical_scratch_4443674}"
 SERVER_HOST="${SERVER_HOST:-0.0.0.0}"
@@ -49,9 +48,15 @@ fi
 if [[ -n "${TASK:-}" ]]; then
   ARGS+=(--task "${TASK}")
 fi
+if [[ -n "${TEXT_EMBEDDING_CACHE_DIR:-}" ]]; then
+  ARGS+=(--text-embedding-cache-dir "${TEXT_EMBEDDING_CACHE_DIR}")
+fi
+if [[ -n "${SERVING_CONFIG:-}" ]]; then
+  ARGS+=(--serving-config "${SERVING_CONFIG}")
+fi
 
 echo "[slurm] job_id=${SLURM_JOB_ID:-local} node=$(hostname)"
 echo "[slurm] run_dir=${RUN_DIR} server=${SERVER_HOST}:${SERVER_PORT}"
 echo "[slurm] visual_input=resolved_from_config action_infer_mode=${ACTION_INFER_MODE}"
 
-exec bash "${FASTWAM_REPO}/scripts/pixi_run.sh" python "${ARGS[@]}"
+exec bash "${REPO_ROOT}/scripts/pixi_run.sh" python "${ARGS[@]}"
